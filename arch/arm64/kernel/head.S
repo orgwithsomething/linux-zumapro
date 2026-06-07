@@ -363,6 +363,7 @@ SYM_FUNC_START_LOCAL(secondary_startup)
 	 * Common entry point for secondary CPUs.
 	 */
 	mov	x20, x0				// preserve boot mode
+	bl	finalise_el2
 
 #ifdef CONFIG_ARM64_VA_BITS_52
 alternative_if ARM64_HAS_VA52
@@ -382,9 +383,6 @@ SYM_FUNC_END(secondary_startup)
 SYM_FUNC_START_LOCAL(__secondary_switched)
 	mov	x0, x20
 	bl	set_cpu_boot_mode_flag
-
-	mov	x0, x20
-	bl	finalise_el2
 
 	str_l	xzr, __early_cpu_boot_status, x3
 	adr_l	x5, vectors
