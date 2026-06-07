@@ -63,6 +63,9 @@ bool last_level_cache_is_valid(unsigned int cpu)
 	if (!cache_leaves(cpu) || !per_cpu_cacheinfo(cpu))
 		return false;
 
+	if (use_arch_info)
+		return true;
+
 	llc = per_cpu_cacheinfo_idx(cpu, cache_leaves(cpu) - 1);
 
 	return (llc->attributes & CACHE_ID) || !!llc->fw_token;
@@ -402,8 +405,10 @@ static int cache_setup_properties(unsigned int cpu)
 		ret = cache_setup_acpi(cpu);
 
 	// Assume there is no cache information available in DT/ACPI from now.
-	if (ret && use_arch_cache_info())
+	if (ret && use_arch_cache_info()) {
 		use_arch_info = true;
+		return 0;
+	}
 
 	return ret;
 }
