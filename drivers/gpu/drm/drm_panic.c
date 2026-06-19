@@ -58,7 +58,9 @@ MODULE_LICENSE("GPL");
  * This module displays a user friendly message on screen when a kernel panic
  * occurs. This is conflicting with fbcon, so you can only enable it when fbcon
  * is disabled.
- * It's intended for end-user, so have minimal technical/debug information.
+ * It's intended for end-users, so it starts with a clear explanation and
+ * reboot instruction, followed by the most recent kernel messages for anyone
+ * diagnosing or reporting the crash.
  *
  * Implementation details:
  *
@@ -86,6 +88,8 @@ static struct drm_panic_line panic_msg[] = {
 };
 
 static const size_t panic_msg_lines = ARRAY_SIZE(panic_msg);
+static const struct drm_panic_line panic_log_header =
+	PANIC_LINE("Recent kernel messages:");
 
 static const struct drm_panic_line logo_ascii[] = {
 	PANIC_LINE("     .--.        _"),
@@ -476,6 +480,90 @@ static void drm_panic_logo_draw(struct drm_scanout_buffer *sb, struct drm_rect *
 				   fg_color);
 }
 
+/*
+ * Draw one line of kmsg, and handle wrapping if it won't fit in the screen width.
+ * Return the y-offset of the next line.
+ */
+static int draw_line_with_wrap(struct drm_scanout_buffer *sb, const struct font_desc *font,
+			       const struct drm_panic_line *line, const struct drm_rect *clip,
+			       int yoffset, u32 fg_color)
+{
+	int chars_per_row = drm_rect_width(clip) / font->width;
+	struct drm_rect r_txt = DRM_RECT_INIT(clip->x1, yoffset,
+					     drm_rect_width(clip), font->height);
+	struct drm_panic_line line_wrap;
+
+	if (!chars_per_row)
+		return clip->y1 - 1;
+
+	if (line->len > chars_per_row) {
+		line_wrap.len = line->len % chars_per_row;
+		if (!line_wrap.len)
+			line_wrap.len = chars_per_row;
+		line_wrap.txt = line->txt + line->len - line_wrap.len;
+		draw_txt_rectangle(sb, font, &line_wrap, 1, false, &r_txt, fg_color);
+		r_txt.y1 -= font->height;
+		if (r_txt.y1 < clip->y1)
+			return r_txt.y1;
+		while (line_wrap.txt > line->txt) {
+			line_wrap.txt -= chars_per_row;
+			line_wrap.len = chars_per_row;
+			draw_txt_rectangle(sb, font, &line_wrap, 1, false, &r_txt, fg_color);
+			r_txt.y1 -= font->height;
+			if (r_txt.y1 < clip->y1)
+				return r_txt.y1;
+		}
+	} else {
+		draw_txt_rectangle(sb, font, line, 1, false, &r_txt, fg_color);
+		r_txt.y1 -= font->height;
+	}
+	return r_txt.y1;
+}
+
+/*
+ * Draw the kmsg buffer in a rectangle, starting from the youngest message at
+ * the bottom and going up until reaching the top.
+ */
+static void draw_kmsg_tail(struct drm_scanout_buffer *sb, const struct font_desc *font,
+			   const struct drm_rect *clip, u32 fg_color)
+{
+	struct kmsg_dump_iter iter;
+	char kmsg_buf[512];
+	size_t kmsg_len;
+	struct drm_panic_line line;
+	int yoffset;
+
+	if (drm_rect_width(clip) < font->width ||
+	    drm_rect_height(clip) < font->height)
+		return;
+
+	yoffset = clip->y2 - font->height;
+
+	kmsg_dump_rewind(&iter);
+	while (kmsg_dump_get_buffer(&iter, false, kmsg_buf, sizeof(kmsg_buf), &kmsg_len)) {
+		char *start;
+		char *end;
+
+		if (kmsg_len < 2)
+			continue;
+
+		/* ignore terminating NUL and newline */
+		start = kmsg_buf + kmsg_len - 2;
+		end = kmsg_buf + kmsg_len - 1;
+		while (start > kmsg_buf && yoffset >= clip->y1) {
+			while (start > kmsg_buf && *start != '\n')
+				start--;
+			/* don't count the newline character */
+			line.txt = start + (start == kmsg_buf ? 0 : 1);
+			line.len = end - line.txt;
+
+			yoffset = draw_line_with_wrap(sb, font, &line, clip, yoffset, fg_color);
+			end = start;
+			start--;
+		}
+	}
+}
+
 static void draw_panic_screen_user(struct drm_scanout_buffer *sb)
 {
 	u32 fg_color = drm_draw_color_from_xrgb8888(CONFIG_DRM_PANIC_FOREGROUND_COLOR,
@@ -483,8 +571,8 @@ static void draw_panic_screen_user(struct drm_scanout_buffer *sb)
 	u32 bg_color = drm_draw_color_from_xrgb8888(CONFIG_DRM_PANIC_BACKGROUND_COLOR,
 						    sb->format->format);
 	const struct font_desc *font = get_default_font(sb->width, sb->height, NULL, NULL);
-	struct drm_rect r_screen, r_logo, r_msg;
-	unsigned int msg_width, msg_height;
+	struct drm_rect r_screen, r_logo, r_msg, r_log_header, r_log;
+	unsigned int msg_width, msg_height, msg_y, log_height;
 
 	if (!font)
 		return;
@@ -494,51 +582,30 @@ static void draw_panic_screen_user(struct drm_scanout_buffer *sb)
 
 	msg_width = min(get_max_line_len(panic_msg, panic_msg_lines) * font->width, sb->width);
 	msg_height = min(panic_msg_lines * font->height, sb->height);
-	r_msg = DRM_RECT_INIT(0, 0, msg_width, msg_height);
+	msg_y = min_t(unsigned int, font->height, sb->height - msg_height);
+	r_msg = DRM_RECT_INIT(0, msg_y, msg_width, msg_height);
+	drm_rect_translate(&r_msg, (sb->width - r_msg.x2) / 2, 0);
 
-	/* Center the panic message */
-	drm_rect_translate(&r_msg, (sb->width - r_msg.x2) / 2, (sb->height - r_msg.y2) / 2);
+	r_log_header = DRM_RECT_INIT(0, r_msg.y2 + font->height,
+				     sb->width, font->height);
+	log_height = r_log_header.y2 < sb->height ? sb->height - r_log_header.y2 : 0;
+	r_log = DRM_RECT_INIT(0, r_log_header.y2, sb->width, log_height);
 
 	/* Fill with the background color, and draw text on top */
 	drm_panic_fill(sb, &r_screen, bg_color);
 
-	if (!drm_rect_overlap(&r_logo, &r_msg))
+	if (!drm_rect_overlap(&r_logo, &r_msg) &&
+	    !drm_rect_overlap(&r_logo, &r_log_header) &&
+	    !drm_rect_overlap(&r_logo, &r_log))
 		drm_panic_logo_draw(sb, &r_logo, font, fg_color);
 
 	draw_txt_rectangle(sb, font, panic_msg, panic_msg_lines, true, &r_msg, fg_color);
-}
 
-/*
- * Draw one line of kmsg, and handle wrapping if it won't fit in the screen width.
- * Return the y-offset of the next line.
- */
-static int draw_line_with_wrap(struct drm_scanout_buffer *sb, const struct font_desc *font,
-			       struct drm_panic_line *line, int yoffset, u32 fg_color)
-{
-	int chars_per_row = sb->width / font->width;
-	struct drm_rect r_txt = DRM_RECT_INIT(0, yoffset, sb->width, font->height);
-	struct drm_panic_line line_wrap;
-
-	if (line->len > chars_per_row) {
-		line_wrap.len = line->len % chars_per_row;
-		line_wrap.txt = line->txt + line->len - line_wrap.len;
-		draw_txt_rectangle(sb, font, &line_wrap, 1, false, &r_txt, fg_color);
-		r_txt.y1 -= font->height;
-		if (r_txt.y1 < 0)
-			return r_txt.y1;
-		while (line_wrap.txt > line->txt) {
-			line_wrap.txt -= chars_per_row;
-			line_wrap.len = chars_per_row;
-			draw_txt_rectangle(sb, font, &line_wrap, 1, false, &r_txt, fg_color);
-			r_txt.y1 -= font->height;
-			if (r_txt.y1 < 0)
-				return r_txt.y1;
-		}
-	} else {
-		draw_txt_rectangle(sb, font, line, 1, false, &r_txt, fg_color);
-		r_txt.y1 -= font->height;
+	if (drm_rect_height(&r_log) >= font->height) {
+		draw_txt_rectangle(sb, font, &panic_log_header, 1, false,
+				   &r_log_header, fg_color);
+		draw_kmsg_tail(sb, font, &r_log, fg_color);
 	}
-	return r_txt.y1;
 }
 
 /*
@@ -553,40 +620,13 @@ static void draw_panic_screen_kmsg(struct drm_scanout_buffer *sb)
 						    sb->format->format);
 	const struct font_desc *font = get_default_font(sb->width, sb->height, NULL, NULL);
 	struct drm_rect r_screen = DRM_RECT_INIT(0, 0, sb->width, sb->height);
-	struct kmsg_dump_iter iter;
-	char kmsg_buf[512];
-	size_t kmsg_len;
-	struct drm_panic_line line;
-	int yoffset;
 
 	if (!font || font->width > sb->width)
 		return;
 
-	yoffset = sb->height - font->height - (sb->height % font->height) / 2;
-
 	/* Fill with the background color, and draw text on top */
 	drm_panic_fill(sb, &r_screen, bg_color);
-
-	kmsg_dump_rewind(&iter);
-	while (kmsg_dump_get_buffer(&iter, false, kmsg_buf, sizeof(kmsg_buf), &kmsg_len)) {
-		char *start;
-		char *end;
-
-		/* ignore terminating NUL and newline */
-		start = kmsg_buf + kmsg_len - 2;
-		end = kmsg_buf + kmsg_len - 1;
-		while (start > kmsg_buf && yoffset >= 0) {
-			while (start > kmsg_buf && *start != '\n')
-				start--;
-			/* don't count the newline character */
-			line.txt = start + (start == kmsg_buf ? 0 : 1);
-			line.len = end - line.txt;
-
-			yoffset = draw_line_with_wrap(sb, font, &line, yoffset, fg_color);
-			end = start;
-			start--;
-		}
-	}
+	draw_kmsg_tail(sb, font, &r_screen, fg_color);
 }
 
 #if defined(CONFIG_DRM_PANIC_SCREEN_QR_CODE)
