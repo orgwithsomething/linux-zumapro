@@ -90,10 +90,10 @@ config DRM_PANIC_SCREEN
 	default "user"
 	depends on DRM_PANIC
 	help
-	  This option enable to choose what will be displayed when a kernel
-	  panic occurs. You can choose between "user", a short message telling
-	  the user to reboot the system, or "kmsg" which will display the last
-	  lines of kmsg.
+	  This option lets you choose what will be displayed when a kernel
+	  panic occurs. You can choose between "user", a clear message telling
+	  the user to reboot the system followed by the last lines of kmsg, or
+	  "kmsg" which uses the full screen for the last lines of kmsg.
 	  This can also be overridden by drm.panic_screen=xxxx kernel parameter
 	  or by writing to /sys/module/drm/parameters/panic_screen sysfs entry
 	  Default is "user"
