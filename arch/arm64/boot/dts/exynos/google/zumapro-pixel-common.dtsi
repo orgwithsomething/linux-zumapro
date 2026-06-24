@@ -497,6 +497,7 @@
 	pmic@66 {
 		compatible = "maxim,max77779";
 		reg = <0x66>;
+		power-supplies = <&max77759tcpc>;
 
 		pinctrl-0 = <&if_pmic_int>;
 		pinctrl-names = "default";
