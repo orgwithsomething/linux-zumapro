@@ -244,6 +244,13 @@ static int max_tcpci_set_vbus(struct tcpci *tcpci, struct tcpci_data *tdata, boo
 		return -EINVAL;
 	}
 
+	/*
+	 * A VBUS regulator is optional for sink-only ports. Avoid requesting a
+	 * dummy regulator every time TCPM updates the sink state.
+	 */
+	if (!source && IS_ERR_OR_NULL(chip->vbus_reg))
+		return 1;
+
 	ret = get_vbus_regulator_handle(chip);
 	if (ret) {
 		/*
