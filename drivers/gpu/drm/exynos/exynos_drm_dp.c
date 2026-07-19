@@ -6,9 +6,10 @@
  */
 #include <linux/console.h>
 #include <linux/component.h>
+#include <linux/gpio/consumer.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/of_gpio.h>
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/of_device.h>
@@ -3286,7 +3287,7 @@ static irqreturn_t exynos_drm_dp_irq(int irq, void *dev_id)
 	struct device *dev = dp->dev;
 	u32 irq_type = 0, val;
 	int i = 0;
-	bool valid_gpio = gpio_is_valid(dp->hpd_gpio);
+	bool valid_gpio = !!dp->hpd_gpio;
 	unsigned long flags;
 
 	spin_lock_irqsave(&dp->slock, flags);
@@ -3345,8 +3346,8 @@ static irqreturn_t exynos_drm_dp_hpd_gpio_irq_thread(int irq, void *dev_id)
 
 	spin_lock_irqsave(&dp->slock, flags);
 
-	if ((gpio_get_value(dp->hpd_gpio) == HPD_PLUG) &&
-			dp->hpd_state == HPD_UNPLUG) {
+	if ((gpiod_get_value(dp->hpd_gpio) == HPD_PLUG) &&
+	    dp->hpd_state == HPD_UNPLUG) {
 		queue_delayed_work(dp->dp_wq, &dp->hpd_plug_work, 0);
 		dp_log_info(dev, "GPIO_HPD_PLUG detect\n");
 	}
@@ -3523,13 +3524,16 @@ static ssize_t exynos_drm_dp_store_hpd_irq(struct device *dev,
 {
 	struct exynos_drm_dp *drm_dp = dev_get_drvdata(dev);
 	struct exynos_dp_subdev *dp = drm_dp->subdev;
+	int ret;
 
 	if (dp->hpd_state == HPD_UNPLUG) {
 		dp_log_err(dp->dev, "hpd state unplug\n");
 		return -EACCES;
 	}
 
-	kstrtobool(buf, &dp->dp_debug.debug_hpd_irq);
+	ret = kstrtobool(buf, &dp->dp_debug.debug_hpd_irq);
+	if (ret)
+		return ret;
 
 	queue_delayed_work(dp->dp_wq, &dp->hpd_irq_work, 0);
 
@@ -3563,13 +3567,16 @@ static ssize_t exynos_drm_dp_store_set_lt(struct device *dev,
 {
 	struct exynos_drm_dp *drm_dp = dev_get_drvdata(dev);
 	struct exynos_dp_subdev *dp = drm_dp->subdev;
+	int ret;
 
 	if (dp->hpd_state == HPD_UNPLUG) {
 		dp_log_err(dp->dev, "hpd state unplug\n");
 		return -EACCES;
 	}
 
-	kstrtou32(buf, 0, &dp->dp_debug.debug_lt);
+	ret = kstrtou32(buf, 0, &dp->dp_debug.debug_lt);
+	if (ret)
+		return ret;
 
 	return len;
 }
@@ -3708,19 +3715,18 @@ static int exynos_drm_dp_subdev_probe(u32 id, struct device *dev,
 
 	spin_lock_init(&dp->slock);
 
-	dp->hpd_gpio = of_get_named_gpio(dev->of_node, "samsung,hpd-gpio", 0);
+	dp->hpd_gpio = devm_gpiod_get_optional(dp->dev, "hpd", GPIOD_IN);
+	if (IS_ERR(dp->hpd_gpio)) {
+		ret = dev_err_probe(dev, PTR_ERR(dp->hpd_gpio),
+				    "failed to get HPD GPIO\n");
+		goto err_devm_alloc;
+	}
 
-	if (gpio_is_valid(dp->hpd_gpio)) {
-		ret = devm_gpio_request_one(dp->dev, dp->hpd_gpio, GPIOF_IN, "hpd_gpio");
-		if (ret) {
-			dp_log_err(dev, "failed to get HPD_GPIO\n");
-			goto err_devm_alloc;
-		}
+	if (dp->hpd_gpio) {
+		dp->hpd_gpio_irq = gpiod_to_irq(dp->hpd_gpio);
 
-		dp->hpd_gpio_irq = gpio_to_irq(dp->hpd_gpio);
-
-		dp_log_dbg(dev, "GPIO_HPD has been registered. GPIO(%d), irq(%d)\n",
-				dp->hpd_gpio, dp->hpd_gpio_irq);
+		dp_log_dbg(dev, "GPIO_HPD has been registered. irq(%d)\n",
+			   dp->hpd_gpio_irq);
 
 		irq_set_status_flags(dp->hpd_gpio_irq, IRQ_NOAUTOEN);
 		ret = devm_request_threaded_irq(dp->dev, dp->hpd_gpio_irq,
@@ -3956,7 +3962,7 @@ bool exynos_drm_dp_is_hpd_connected(struct exynos_dp_subdev *dp)
 	int old_hpd = dp->hpd_state;
 
 	mutex_lock(&dp->lock);
-	if (gpio_get_value(dp->hpd_gpio)) {
+	if (gpiod_get_value(dp->hpd_gpio)) {
 		mutex_unlock(&dp->lock);
 		if (dp->state == DP_STATE_LINKED)
 			exynos_drm_dp_hpd_en(dp);
@@ -4007,7 +4013,7 @@ static int exynos_drm_dp_start(struct exynos_dp_subdev *dp)
 	int ret = 0;
 
 	dp_log_info(dev, "+, state: %d\n", dp->state);
-	if (gpio_get_value(dp->hpd_gpio) == HPD_UNPLUG) {
+	if (gpiod_get_value(dp->hpd_gpio) == HPD_UNPLUG) {
 		dp_log_err(dev, "DP(%d) is unplug\n", dp->id);
 		return 0;
 	}
@@ -4573,8 +4579,10 @@ ret:
 	dp_log_kms(dev, "num_modes %d\n", num_modes);
 	return num_modes;
 }
-static enum drm_mode_status exynos_drm_dp_mode_valid(struct drm_connector *connector,
-			struct drm_display_mode *mode)
+
+static enum drm_mode_status
+exynos_drm_dp_mode_valid(struct drm_connector *connector,
+			 const struct drm_display_mode *mode)
 {
 	struct exynos_drm_dp *dp = connector_to_dp(connector);
 	struct device *dev = dp->dev;
@@ -4838,7 +4846,7 @@ static int exynos_drm_dp_subdev_bind(struct device *dev,
 		goto err_aux_register;
 	}
 
-	if (gpio_get_value(subdev->hpd_gpio))
+	if (gpiod_get_value(subdev->hpd_gpio))
 		exynos_drm_dp_reset(subdev);
 
 	dp_log_dbg(dev, "%s registered for aux_transfer\n", subdev->aux.name);
@@ -5026,7 +5034,7 @@ MODULE_DEVICE_TABLE(of, exynos_drm_dp_match);
 
 struct platform_driver dp_driver = {
 	.probe		= exynos_drm_dp_probe,
-	.remove_new	= exynos_drm_dp_remove,
+	.remove		= exynos_drm_dp_remove,
 	.driver		= {
 		.name	= DEV_NAME,
 		.owner	= THIS_MODULE,

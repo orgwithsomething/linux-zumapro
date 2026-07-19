@@ -84,7 +84,7 @@
 
 		pinctrl-names = "default";
 		pinctrl-0 = <&dp0_hpd>;
-		samsung,hpd-gpio = <&gpa1 0 0x2>;
+		hpd-gpios = <&gpa1 0 0x2>;
 		/* samsung,force-dsc-dis; */
 		/* samsung,mst-dsc-en; */
 

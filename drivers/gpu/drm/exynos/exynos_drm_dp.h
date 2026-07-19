@@ -574,7 +574,7 @@ void dp_reg_deinit(u32 id);
 void dp_reg_set_hpd_interrupt(u32 id, u32 en);
 void dp_reg_set_plug_interrupt(u32 id, u32 en);
 u32 dp_reg_get_hpd_status(u32 id);
-u32 dp_reg_get_int_and_clear(u32 id, u32 irq_reg);
+u32 dp_reg_get_int_and_clear(u32 id, dp_irq_reg_type_t irq_reg);
 void dp_reg_set_video_config(u32 id, struct dp_video_info dp_video_info);
 void dp_reg_set_bist_video_config(u32 id, struct dp_video_info dp_video_info,
 				  u8 type);
@@ -694,7 +694,7 @@ struct exynos_dp_subdev {
 
 	u32 id;
 	int irq;
-	int hpd_gpio;
+	struct gpio_desc *hpd_gpio;
 	int hpd_gpio_irq;
 
 	struct phy *phy;
