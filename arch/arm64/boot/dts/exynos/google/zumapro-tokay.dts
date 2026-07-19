@@ -10,6 +10,7 @@
 #include "zumapro-pixel-common.dtsi"
 #include "zumapro-caimito-wireless.dtsi"
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	model = "Pixel 9";
@@ -23,6 +24,100 @@
 			  <0x9 0x80000000 0x80000000>,
 			  <0xa 0x00000000 0x80000000>,
 			  <0xa 0x80000000 0x80000000>;
+	};
+
+	aoc_sound: aoc-sound {
+		compatible = "google,aoc-sound";
+		aoc = <&aoc>;
+
+		speakers {
+			sound-dai = <&cs35l41_l 0>, <&cs35l41_r 0>;
+		};
+	};
+
+	cs35l41_vp: regulator-cs35l41-vp {
+		compatible = "regulator-fixed";
+		regulator-name = "cs35l41-vp";
+		regulator-min-microvolt = <3700000>;
+		regulator-max-microvolt = <3700000>;
+		regulator-always-on;
+	};
+};
+
+/* Tokay's AOC firmware identity differs from Komodo's KM4 board ID. */
+&aoc {
+	aoc-board-id = <0x40a02>;
+	aoc-board-rev = <0x10000>;
+};
+
+/* The common file leaves this wrapper disabled; Tokay uses it for the amps. */
+&usi19 {
+	samsung,mode = <USI_MODE_SPI>;
+	status = "okay";
+};
+
+/*
+ * The two CS35L41 speaker amplifiers and their wiring are shared by the
+ * Caimito-family boards, including Tokay and Komodo.
+ */
+&spi_19 {
+	status = "okay";
+	num-cs = <2>;
+	cs-gpios = <0>, <&gpn1 0 GPIO_ACTIVE_LOW>;
+
+	cs35l41_l: cs35l41@0 {
+		compatible = "cirrus,cs35l41";
+		reg = <0>;
+		#sound-dai-cells = <1>;
+		spi-max-frequency = <25000000>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&spi3_cs>;
+
+		interrupt-parent = <&gpa5>;
+		interrupts = <5 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&gpp6 3 GPIO_ACTIVE_HIGH>;
+
+		VA-supply = <&s_bucka_reg>;
+		VP-supply = <&cs35l41_vp>;
+
+		cirrus,boost-peak-milliamp = <3500>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <4>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <2>;
+
+		controller-data {
+			samsung,spi-feedback-delay = <1>;
+			samsung,spi-chip-select-mode = <0>;
+		};
+	};
+
+	cs35l41_r: cs35l41@1 {
+		compatible = "cirrus,cs35l41";
+		reg = <1>;
+		#sound-dai-cells = <1>;
+		sound-name-prefix = "R";
+		spi-max-frequency = <25000000>;
+
+		interrupt-parent = <&gpa7>;
+		interrupts = <2 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&gph2 1 GPIO_ACTIVE_HIGH>;
+
+		VA-supply = <&s_bucka_reg>;
+		VP-supply = <&cs35l41_vp>;
+
+		cirrus,boost-peak-milliamp = <3500>;
+		cirrus,boost-ind-nanohenry = <1000>;
+		cirrus,boost-cap-microfarad = <4>;
+		cirrus,asp-sdout-hiz = <3>;
+		cirrus,gpio2-src-select = <2>;
+		cirrus,right-channel-amp;
+
+		controller-data {
+			samsung,spi-feedback-delay = <1>;
+			samsung,spi-chip-select-mode = <2>;
+		};
 	};
 };
 
@@ -68,9 +163,171 @@
 	};
 };
 
+/*
+ * Production Tokay TK4C display. Unlike Komodo, this is 1080x2424 at a
+ * 756 Mbps lane rate and uses the TK4C-specific DSC and command sequence.
+ */
+&decon0 {
+	status = "okay";
+};
+
+&dpu_dma {
+	status = "okay";
+};
+
+&dpp0 {
+	status = "okay";
+};
+
+&dsim0 {
+	status = "okay";
+
+	panel0: panel@0 {
+		compatible = "google,gs-tk4c";
+		reg = <0>;
+		reset-gpios = <&gpp0 0 GPIO_ACTIVE_HIGH>;
+
+		port {
+			panel0_in: endpoint {
+				remote-endpoint = <&dsim0_out>;
+			};
+		};
+	};
+
+	ports {
+		port@1 {
+			reg = <1>;
+			dsim0_out: endpoint {
+				remote-endpoint = <&panel0_in>;
+			};
+		};
+	};
+};
+
 &spitouch {
 	st,dchip_id = /bits/ 8 <0x36 0x48>;
 	st,max-coords = <1079 2399>;
 	st,udfps-coords = <540 1769>;
 	st,touch_offload_id = /bits/ 8 <'0' '0' 'o' '6'>;
+};
+
+/*
+ * Tensor S5400 modem. The PCIe, CP power/reset and bit-banged SPMI wiring is
+ * common to production Caimito-family phones.
+ */
+&pcie_0_phy {
+	status = "okay";
+};
+
+&pcie_0 {
+	status = "okay";
+	pinctrl-0 = <&pcie0_clkreq &pcie0_perst>;
+	pinctrl-names = "default";
+	reset-gpios = <&gph0 0 GPIO_ACTIVE_HIGH>;
+	google,cp-wakeup-gpios = <&gpp16 0 GPIO_ACTIVE_HIGH>;
+	google,cp-power = <&cp_power>;
+};
+
+/ {
+	spmi {
+		compatible = "google,bitbang-spmi-controller";
+		#address-cells = <2>;
+		#size-cells = <0>;
+		sclk-gpios = <&gpa3 2 GPIO_ACTIVE_HIGH>;
+		sdata-gpios = <&gpa3 3 GPIO_ACTIVE_HIGH>;
+		delay-us = <10>;
+
+		cp_pmic: pmic@0 {
+			compatible = "google,cp-pmic-spmi";
+			reg = <0 SPMI_USID>;
+		};
+
+		cp_s5910: s5910@5 {
+			compatible = "google,s5910-spmi";
+			reg = <5 SPMI_USID>;
+		};
+	};
+
+	cp_power: cp-power {
+		compatible = "google,exynos-cp-power";
+		cp-pwr-gpios = <&gpp12 2 GPIO_ACTIVE_HIGH>;
+		cp-nreset-gpios = <&gpp12 3 GPIO_ACTIVE_HIGH>;
+		cp-pm-wrst-gpios = <&gpp8 3 GPIO_ACTIVE_HIGH>;
+		cp-wrst-gpios = <&gpp16 3 GPIO_ACTIVE_HIGH>;
+		cp-pda-active-gpios = <&gpp16 2 GPIO_ACTIVE_HIGH>;
+		cp-dump-noti-gpios = <&gpp16 1 GPIO_ACTIVE_HIGH>;
+		cp2ap-cp-wrst-gpios = <&gpa7 3 GPIO_ACTIVE_HIGH>;
+		google,cp-pmic = <&cp_pmic>;
+		google,cp-dcxo = <&cp_s5910>;
+	};
+};
+
+/* Samsung KEPLER GNSS companion on the shared S5400 phone wiring. */
+&spi_21 {
+	num-cs = <1>;
+
+	gnss@0 {
+		compatible = "samsung,kepler";
+		reg = <0>;
+		spi-max-frequency = <3125000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&gnss_spi_irq &gnss_spi_int>;
+		gnss2ap-gpios = <&gpa5 4 GPIO_ACTIVE_HIGH>;
+		ap2gnss-gpios = <&gpp2 3 GPIO_ACTIVE_HIGH>;
+
+		controller-data {
+			samsung,spi-feedback-delay = <0>;
+			samsung,spi-chip-select-mode = <0>;
+		};
+	};
+};
+
+&pinctrl_far_alive {
+	gnss_spi_irq: gnss-spi-irq-pins {
+		samsung,pins = "gpa5-4";
+		samsung,pin-function = <GS101_PIN_FUNC_EINT>;
+		samsung,pin-pud = <GS101_PIN_PULL_DOWN>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+};
+
+&pinctrl_peric0 {
+	gnss_spi_int: gnss-spi-int-pins {
+		samsung,pins = "gpp2-3";
+		samsung,pin-function = <GS101_PIN_FUNC_OUTPUT>;
+		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
+		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
+	};
+};
+
+/ {
+	reserved-memory {
+		cp_rmem_reserved: cp-rmem@ea400000 {
+			reg = <0x0 0xea400000 0xc00000>;
+			no-map;
+		};
+
+		cp_msi_rmem_reserved: cp-msi-rmem@f6200000 {
+			reg = <0x0 0xf6200000 0x1000>;
+			no-map;
+		};
+
+		cp_pktproc_rmem_reserved: cp-pktproc-rmem@e8000000 {
+			reg = <0x0 0xe8000000 0x2000000>;
+			no-map;
+		};
+	};
+
+	modem {
+		compatible = "samsung,s5300-modem";
+		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
+				<&cp_pktproc_rmem_reserved>;
+		memory-region-names = "ipc", "msi", "pktproc";
+		firmware-name = "google/s5400/modem/images/default/modem.bin";
+		google,pcie = <&pcie_0>;
+		samsung,doorbell-addr = <0x14e60000>;
+		cp2ap-wakeup-gpios = <&gpa5 1 GPIO_ACTIVE_HIGH>;
+		cp2ap-active-gpios = <&gpa5 2 GPIO_ACTIVE_HIGH>;
+		cp-partial-rst-gpios = <&gpp21 6 GPIO_ACTIVE_HIGH>;
+	};
 };
