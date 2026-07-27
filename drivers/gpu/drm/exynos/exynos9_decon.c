@@ -1771,10 +1771,12 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
 	 * In command mode the panel's hardware TE drives vblank (see
 	 * decon_te_irq_handler): it is continuous and panel-synced, so page-flips
 	 * complete and no-op commits (e.g. framebuffer removal, which emit no new
-	 * frame) still observe a vblank instead of timing out.  In video mode
-	 * there is no panel TE, so frame-done is the vblank.
+	 * frame) still observe a vblank instead of timing out. If the board does
+	 * not expose TE as a GPIO IRQ, use DECON frame-done instead; otherwise
+	 * every command-mode page flip waits for the DRM vblank timeout. In video
+	 * mode there is no panel TE, so frame-done is always the vblank.
 	 */
-	if (ctx->config.mode.op_mode == DECON_VIDEO_MODE)
+	if (ctx->config.mode.op_mode == DECON_VIDEO_MODE || ctx->te_irq <= 0)
 		drm_crtc_handle_vblank(&ctx->crtc->base);
 
 	return IRQ_HANDLED;
@@ -1816,9 +1818,10 @@ static int decon_probe(struct platform_device *pdev)
 				     "Failed to register interrupt handler\n");
 
 	/*
-	 * Command-mode vblank source: the panel's hardware TE.  The te-gpio lives
-	 * in the DSIM node (the DECON's OF-graph peer, muxed to EINT), so grab it
-	 * there and use it as a continuous, panel-synced vblank.  Leave it
+	 * Command-mode vblank source: the panel's hardware TE. The te-gpios
+	 * property lives in the DSIM node (the DECON's OF-graph peer, muxed to
+	 * EINT), so grab it there and use it as a continuous, panel-synced
+	 * vblank. Leave it
 	 * disabled until enable_vblank(); HW trigger still drives the frame latch.
 	 */
 	dsi_np = of_graph_get_remote_node(dev->of_node, 0, 0);
