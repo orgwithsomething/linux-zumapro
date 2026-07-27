@@ -1292,7 +1292,8 @@ brcmf_msgbuf_process_rx_complete(struct brcmf_msgbuf *msgbuf, void *buf)
 		ifp = msgbuf->drvr->mon_if;
 
 		if (!ifp) {
-			bphy_err(drvr, "Received unexpected monitor pkt\n");
+			bphy_info_once(drvr,
+				       "Dropping monitor packet without a monitor interface\n");
 			brcmu_pkt_buf_free_skb(skb);
 			return;
 		}
