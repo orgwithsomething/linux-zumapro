@@ -29,6 +29,7 @@ struct tokay_panel {
 	struct mipi_dsi_device *dsi;
 	struct drm_connector *connector;
 	struct gpio_desc *reset_gpio;
+	bool handoff;
 };
 
 /* Production TK4C PPS configuration (DSC 1.2a, two 540-pixel slices). */
@@ -114,9 +115,24 @@ static int tokay_panel_unprepare(struct drm_panel *panel)
 static int tokay_panel_prepare(struct drm_panel *panel)
 {
 	struct tokay_panel *ctx = to_tokay_panel(panel);
+	int ret;
+
+	/*
+	 * The bootloader leaves TK4C enabled and displaying its splash. Keep the
+	 * reset line and panel registers untouched for the first DRM enable so
+	 * DECON, DSIM and the panel all participate in the same handoff.
+	 */
+	if (ctx->handoff) {
+		dev_notice(&ctx->dsi->dev,
+			   "preserving bootloader panel during prepare\n");
+		return 0;
+	}
 
 	/* Downstream TK4C reset timing: low 1 ms, high 1 ms. */
 	if (ctx->reset_gpio) {
+		ret = gpiod_direction_output(ctx->reset_gpio, 0);
+		if (ret)
+			return ret;
 		gpiod_set_value_cansleep(ctx->reset_gpio, 0);
 		usleep_range(1000, 1100);
 		gpiod_set_value_cansleep(ctx->reset_gpio, 1);
@@ -158,6 +174,13 @@ static int tokay_panel_enable(struct drm_panel *panel)
 	struct mipi_dsi_device *dsi = ctx->dsi;
 	struct drm_dsc_picture_parameter_set pps;
 	int ret;
+
+	if (ctx->handoff) {
+		ctx->handoff = false;
+		dev_notice(&dsi->dev,
+			   "preserving bootloader panel during first enable\n");
+		return 0;
+	}
 
 	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
 	if (ret < 0)
@@ -282,9 +305,14 @@ static int tokay_panel_probe(struct mipi_dsi_device *dsi)
 		return PTR_ERR(ctx);
 
 	ctx->dsi = dsi;
+	ctx->handoff = true;
 	mipi_dsi_set_drvdata(dsi, ctx);
 
-	ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
+	/*
+	 * Do not change the bootloader-owned reset level merely by probing the
+	 * panel. The cold prepare path takes ownership explicitly when needed.
+	 */
+	ctx->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_ASIS);
 	if (IS_ERR(ctx->reset_gpio))
 		return dev_err_probe(dev, PTR_ERR(ctx->reset_gpio),
 				     "failed to get reset gpio\n");
