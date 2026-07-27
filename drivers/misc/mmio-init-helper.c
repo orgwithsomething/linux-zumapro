@@ -29,20 +29,34 @@
 static int mmio_init_helper_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	struct resource *res;
 	void __iomem *base;
 	u32 value;
 	u32 mask;
 	u32 reg;
 	bool has_mask;
 
-	base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(base))
-		return dev_err_probe(dev, PTR_ERR(base),
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (!res)
+		return dev_err_probe(dev, -EINVAL,
+				     "missing MMIO resource\n");
+
+	/*
+	 * This is a one-shot initializer, not the owner of the containing
+	 * hardware block. Do not request the region: a later functional driver
+	 * may legitimately need to claim a larger resource which contains this
+	 * register (for example DECON contains the autorefresh register).
+	 */
+	base = ioremap(res->start, resource_size(res));
+	if (!base)
+		return dev_err_probe(dev, -ENOMEM,
 				     "failed to map MMIO resource\n");
 
-	if (of_property_read_u32(dev->of_node, "value", &value))
+	if (of_property_read_u32(dev->of_node, "value", &value)) {
+		iounmap(base);
 		return dev_err_probe(dev, -EINVAL,
 				     "missing required property: value\n");
+	}
 
 	has_mask = !of_property_read_u32(dev->of_node, "mask", &mask);
 	if (has_mask) {
@@ -52,6 +66,9 @@ static int mmio_init_helper_probe(struct platform_device *pdev)
 	} else {
 		writel(value, base);
 	}
+	/* Ensure the one-shot write reaches the device before unmapping it. */
+	wmb();
+	iounmap(base);
 
 	dev_info(dev, "MMIO init write complete%s\n",
 		 has_mask ? " (masked)" : "");
