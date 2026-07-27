@@ -820,13 +820,24 @@ static int zuma_decon_enable(struct decon_context *ctx)
 	zuma_reg_set_urgent(id);
 	zuma_reg_set_rgb_order(id, order);
 	zuma_reg_set_data_path(id, cfg->out_type, dsc != NULL);
-	/* DSC path must be set up after the data path enables the encoders */
-	if (dsc) {
-		zuma_reg_set_dsc(id, dsc);
-		zuma_reg_set_outfifo_dsc(id, dsc, cfg->image_height);
-	} else {
+
+	/*
+	 * Tokay is a boot-display handover: the bootloader has already
+	 * programmed both DSC encoders and the OUTFIFO to match the panel's PPS.
+	 * Rewriting that state here produces alternating damaged bands exactly
+	 * one TK4C slice (101 lines) high. Keep the live, known-good DSC state
+	 * while changing only the upstream framebuffer/window.
+	 *
+	 * Other panels retain the normal cold-programming path until their
+	 * handover state has been verified in the same way.
+	 */
+	if (!dsc) {
 		zuma_reg_set_outfifo_size(id, cfg->image_width,
 					  cfg->image_height);
+	} else if (dsc != &tokay_tk4c_dsc) {
+		/* DSC path must be set up after the data path enables the encoders */
+		zuma_reg_set_dsc(id, dsc);
+		zuma_reg_set_outfifo_dsc(id, dsc, cfg->image_height);
 	}
 	zuma_reg_init_trigger(id, &cfg->mode);
 	zuma_reg_clear_int_all(id);
