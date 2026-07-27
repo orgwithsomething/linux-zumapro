@@ -3,6 +3,7 @@
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/dma-mapping.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -39,29 +40,35 @@ static unsigned int channel_map[] = { 5, 1, 7, 2, 6, 3, 8, 4 };
 #define IDMA_ASSIGNED_MO(_v) ((_v) << 24)
 #define IDMA_ASSIGNED_MO_MASK (0xffU << 24)
 #define IDMA_IRQ 0x0004
-#define IDMA_AFBC_CONFLICT_IRQ BIT(25)
-#define IDMA_VR_CONFLICT_IRQ BIT(24)
-#define IDMA_AFBC_TIMEOUT_IRQ BIT(23)
+#define IDMA_VOTF_ERROR_IRQ BIT(27)
+#define IDMA_AXI_ADDR_ERROR_IRQ BIT(26)
+#define IDMA_MO_CONFLICT_IRQ BIT(24)
+#define IDMA_FBC_ERROR_IRQ BIT(23)
 #define IDMA_RECOVERY_START_IRQ BIT(22)
 #define IDMA_CONFIG_ERROR BIT(21)
-#define IDMA_LOCAL_HW_RESET_DONE BIT(20)
+#define IDMA_INST_OFF_DONE BIT(20)
 #define IDMA_READ_SLAVE_ERROR BIT(19)
 #define IDMA_STATUS_DEADLOCK_IRQ BIT(17)
 #define IDMA_STATUS_FRAMEDONE_IRQ BIT(16)
-#define IDMA_ALL_IRQ_CLEAR (0x3FB << 16)
+#define IDMA_ALL_IRQ_CLEAR (0xDFBU << 16)
 
 #define IDMA_ALL_IRQ                                                           \
-	(IDMA_AFBC_CONFLICT_IRQ | IDMA_VR_CONFLICT_IRQ |                       \
-	 IDMA_AFBC_TIMEOUT_IRQ | IDMA_RECOVERY_START_IRQ | IDMA_CONFIG_ERROR | \
-	 IDMA_LOCAL_HW_RESET_DONE | IDMA_READ_SLAVE_ERROR |                    \
+	(IDMA_VOTF_ERROR_IRQ | IDMA_AXI_ADDR_ERROR_IRQ | IDMA_MO_CONFLICT_IRQ | \
+	 IDMA_FBC_ERROR_IRQ | IDMA_RECOVERY_START_IRQ | IDMA_CONFIG_ERROR |    \
+	 IDMA_INST_OFF_DONE | IDMA_READ_SLAVE_ERROR |                          \
 	 IDMA_STATUS_DEADLOCK_IRQ | IDMA_STATUS_FRAMEDONE_IRQ)
 
-#define IDMA_AFBC_CONFLICT_MASK BIT(10)
+#define IDMA_VOTF_ERROR_MASK BIT(12)
+#define IDMA_AXI_ADDR_ERROR_MASK BIT(11)
+#define IDMA_MO_CONFLICT_MASK BIT(9)
+#define IDMA_FBC_ERROR_MASK BIT(8)
+#define IDMA_RECOVERY_START_MASK BIT(7)
 #define IDMA_CONFIG_ERROR_MASK BIT(6)
+#define IDMA_INST_OFF_DONE_MASK BIT(5)
 #define IDMA_READ_SLAVE_ERROR_MASK BIT(4)
 #define IDMA_IRQ_DEADLOCK_MASK BIT(2)
 #define IDMA_IRQ_FRAMEDONE_MASK BIT(1)
-#define IDMA_ALL_IRQ_MASK (0x3FB << 1)
+#define IDMA_ALL_IRQ_MASK (0xDFBU << 1)
 #define IDMA_IRQ_ENABLE BIT(0)
 
 #define IDMA_IN_CON 0x0008
@@ -72,10 +79,10 @@ static unsigned int channel_map[] = { 5, 1, 7, 2, 6, 3, 8, 4 };
 #define IDMA_IMG_FORMAT(_v) ((_v) << 8)
 #define IDMA_IMG_FORMAT_MASK (0x3f << 8)
 /*
- * DRM fourccs are little-endian (DRM_FORMAT_XRGB8888 = 0xXXRRGGBB stored as
- * bytes B,G,R,X), so the IDMA format that consumes those bytes in order is the
- * one Samsung names "BGRX8888" - not "XRGB8888". Confirmed on hardware: fmt 7
- * leaks the X byte into blue, fmt 4 renders correctly.
+ * DRM fourccs describe a little-endian packed word. DRM_FORMAT_XRGB8888 is
+ * therefore stored as bytes B,G,R,X, which this IDMA consumes as BGRX8888.
+ * Tokay hardware confirms this: format 7 corrupts XR24 scanout while format 4
+ * renders it correctly.
  */
 #define IDMA_IMG_FORMAT_BGRA8888 (0)
 #define IDMA_IMG_FORMAT_RGBA8888 (1)
@@ -92,7 +99,11 @@ static unsigned int channel_map[] = { 5, 1, 7, 2, 6, 3, 8, 4 };
 #define IDMA_IMG_FORMAT_ABGR2101010 (18)
 #define IDMA_IMG_FORMAT_ARGB2101010 (19)
 
-#define IDMA_BLOCK_EN BIT(3)
+#define IDMA_ROT_MASK (0x7 << 4)
+#define IDMA_AFBC_EN BIT(3)
+#define IDMA_SBWC_EN BIT(2)
+#define IDMA_SAJC_EN BIT(1)
+#define IDMA_BLOCK_EN BIT(0)
 
 #define IDMA_QOS_LUT_LOW 0x0130
 #define IDMA_QOS_LUT_HIGH 0x0134
@@ -210,37 +221,43 @@ static u32 idma_reg_get_irq_and_clear(struct exynos_dpu_dma_context *ctx,
 
 	val = dma_read_mask(ctx, id, IDMA_IRQ, IDMA_ALL_IRQ);
 
-	if (val & IDMA_AFBC_CONFLICT_IRQ) {
-		pr_err("AFBC conflict occur\n");
+	if (val & IDMA_VOTF_ERROR_IRQ)
+		pr_err("IDMA%u VOTF error (irq=%#x)\n", id, val);
+
+	if (val & IDMA_AXI_ADDR_ERROR_IRQ)
+		pr_err("IDMA%u AXI address error (irq=%#x)\n", id, val);
+
+	if (val & IDMA_MO_CONFLICT_IRQ) {
+		pr_err("IDMA%u outstanding-request conflict (irq=%#x)\n",
+		       id, val);
 	}
 
-	if (val & IDMA_VR_CONFLICT_IRQ) {
-		pr_err("VR conflict occur\n");
-	}
+	if (val & IDMA_FBC_ERROR_IRQ)
+		pr_err("IDMA%u compression error (irq=%#x)\n", id, val);
 
 	if (val & IDMA_RECOVERY_START_IRQ) {
-		pr_err("recovery start occur\n");
+		pr_err("IDMA%u recovery started (irq=%#x)\n", id, val);
 	}
 
 	if (val & IDMA_CONFIG_ERROR) {
 		cfg_err = dma_read(ctx, id, IDMA_S_CFG_ERR_STATE);
-		pr_err("config error occur(0x%x)\n", cfg_err);
+		pr_err("IDMA%u config error (irq=%#x, state=%#x)\n",
+		       id, val, cfg_err);
 	}
 
-	if (val & IDMA_LOCAL_HW_RESET_DONE) {
-		pr_err("local hw reset done\n");
-	}
+	if (val & IDMA_INST_OFF_DONE)
+		pr_debug("IDMA%u instant-off done\n", id);
 
 	if (val & IDMA_READ_SLAVE_ERROR) {
-		pr_err("read slave error occur\n");
+		pr_err("IDMA%u read slave error (irq=%#x)\n", id, val);
 	}
 
 	if (val & IDMA_STATUS_DEADLOCK_IRQ) {
-		pr_err("status deadlock occur\n");
+		pr_err("IDMA%u deadlock (irq=%#x)\n", id, val);
 	}
 
 	if (val & IDMA_STATUS_FRAMEDONE_IRQ) {
-		pr_debug("frame done occur\n");
+		pr_debug("IDMA%u frame done\n", id);
 	}
 
 	dma_reg_clear_irq(ctx, id, val);
@@ -252,9 +269,16 @@ static u32 idma_reg_get_irq_and_clear(struct exynos_dpu_dma_context *ctx,
 static void dma_reg_init(struct exynos_dpu_dma_context *ctx, u32 id,
 			 const unsigned long attr)
 {
-	/* unmask + enable IRQs */
-	dma_write_mask(ctx, id, IDMA_IRQ, 0, IDMA_ALL_IRQ_MASK);
-	dma_write_mask(ctx, id, IDMA_IRQ, ~0, IDMA_IRQ_ENABLE);
+	/*
+	 * IDMA completion is not consumed by this driver: DECON's frame-done
+	 * IRQ drives vblank. Keep every IDMA source masked and its global output
+	 * disabled, matching the IRQ_NOAUTOEN Linux IRQ setup in probe. Writing
+	 * ones to the status fields also clears anything left by the bootloader.
+	 */
+	dma_write_mask(ctx, id, IDMA_IRQ,
+		       IDMA_ALL_IRQ_CLEAR | IDMA_ALL_IRQ_MASK,
+		       IDMA_ALL_IRQ_CLEAR | IDMA_ALL_IRQ_MASK |
+			       IDMA_IRQ_ENABLE);
 
 	/* QoS look-up tables */
 	dma_write(ctx, id, IDMA_QOS_LUT_LOW, 0x44444444);
@@ -278,28 +302,9 @@ static void dma_reg_init(struct exynos_dpu_dma_context *ctx, u32 id,
 		       IDMA_ASSIGNED_MO_MASK);
 }
 
-static irqreturn_t dma_irq_handler(int irq, void *priv)
-{
-	u32 val_dma = 0;
-	struct exynos_dpu_dma_context *ctx = priv;
-
-	val_dma = idma_reg_get_irq_and_clear(ctx, 5);
-
-	/* This interrupt is not mine */
-	if (!val_dma)
-		return IRQ_NONE;
-
-	return IRQ_HANDLED;
-}
-
 /*
- * The IDMA format field names the component order the block reads out of
- * memory; a DRM fourcc names a little-endian packed word, so the matching
- * IDMA format is the byte-reversed fourcc (DRM_FORMAT_XRGB8888 -> bytes
- * B,G,R,X -> IDMA BGRX8888).  Hardcoding one format only worked because the
- * fbdev console happens to be XRGB8888; a compositor picking any other format
- * (ARGB8888, a 10-bit XRGB2101010, ...) was read with the wrong channel order
- * or bit depth, which shows as garbage on screen.
+ * Match a fourcc's in-memory byte order to the order consumed by the IDMA.
+ * These mappings are intentionally component-reversed.
  */
 static u32 idma_img_format(u32 fourcc)
 {
@@ -328,7 +333,10 @@ int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int channel,
 	struct drm_framebuffer *fb = state->base.fb;
 	unsigned int idma = channel_map[channel];
 	dma_addr_t addr = exynos_drm_fb_dma_addr(fb, 0);
+	u32 format = idma_img_format(fb->format->format);
 
+	/* Report and acknowledge any fault from the preceding scanout. */
+	idma_reg_get_irq_and_clear(ctx, idma);
 	dma_reg_init(ctx, idma, 0);
 	dma_write(ctx, idma, IDMA_IN_BASE_ADDR_Y, addr);
 	/* full source buffer: width from the pitch, height from the fb */
@@ -343,9 +351,15 @@ int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int channel,
 	dma_write(ctx, idma, IDMA_IMG_SIZE,
 		  IDMA_IMG_HEIGHT(state->src.h) | IDMA_IMG_WIDTH(state->src.w));
 
+	/*
+	 * The bootloader owns this channel before handover.  The new fb is
+	 * linear and unrotated, so clear any stale compression, transform, and
+	 * block-mode state before selecting its format.
+	 */
 	dma_write_mask(ctx, idma, IDMA_IN_CON,
-		       IDMA_IMG_FORMAT(idma_img_format(fb->format->format)),
-		       IDMA_IMG_FORMAT_MASK);
+		       IDMA_IMG_FORMAT(format),
+		       IDMA_IMG_FORMAT_MASK | IDMA_ROT_MASK | IDMA_AFBC_EN |
+			       IDMA_SBWC_EN | IDMA_SAJC_EN | IDMA_BLOCK_EN);
 
 	return 0;
 }
@@ -381,28 +395,30 @@ static int dpu_dma_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, ctx);
 
+	/*
+	 * IDMA_IN_BASE_ADDR_* are 32-bit registers.  This also makes the DMA
+	 * allocator select memory from Tokay's low-memory CMA area.
+	 */
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return dev_err_probe(dev, ret, "Cannot set 32-bit DMA mask\n");
+
 	ctx->aclk = devm_clk_get_enabled(dev, "aclk");
 	if (IS_ERR(ctx->aclk))
 		return dev_err_probe(dev, PTR_ERR(ctx->aclk),
 				     "Cannot get aclk\n");
-
-	ctx->irq = platform_get_irq(pdev, 0);
-	if (ctx->irq < 0)
-		return ctx->irq;
-
-	ret = devm_request_irq(dev, ctx->irq, dma_irq_handler, 0, pdev->name,
-			       ctx);
-	if (ret)
-		return ret;
-
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res)
 		return -EINVAL;
 
 	ctx->regs = devm_ioremap_resource(dev, res);
-	if (!ctx->regs)
-		return -ENOMEM;
-
+	if (IS_ERR(ctx->regs))
+		return PTR_ERR(ctx->regs);
+	/*
+	 * Frame completion comes from DECON/TE. Do not request the dedicated
+	 * IDMA interrupt because it is unused. IDMA status remains available
+	 * through the polling in dpu_dma_update().
+	 */
 	pm_runtime_enable(dev);
 	/* For turn on attached SYSMMU */
 	ret = pm_runtime_resume_and_get(dev);
@@ -410,10 +426,22 @@ static int dpu_dma_probe(struct platform_device *pdev)
 		pm_runtime_disable(dev);
 		return ret;
 	}
-
-	component_add(dev, &dma_component_ops);
-
+	ret = component_add(dev, &dma_component_ops);
+	if (ret) {
+		pm_runtime_put(dev);
+		pm_runtime_disable(dev);
+		return ret;
+	}
 	return 0;
+}
+
+static void dpu_dma_remove(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+
+	component_del(dev, &dma_component_ops);
+	pm_runtime_put(dev);
+	pm_runtime_disable(dev);
 }
 
 static const struct of_device_id dpu_dma_of_match[] = {
@@ -423,9 +451,10 @@ static const struct of_device_id dpu_dma_of_match[] = {
 MODULE_DEVICE_TABLE(of, dpu_dma_of_match);
 
 struct platform_driver dpu_dma_driver = {
-    .probe          = dpu_dma_probe,
-    .driver         = {
-        .name   = "dpu_dma_driver",
-        .of_match_table = of_match_ptr(dpu_dma_of_match),
-    },
+	.probe = dpu_dma_probe,
+	.remove = dpu_dma_remove,
+	.driver = {
+		.name = "dpu_dma_driver",
+		.of_match_table = of_match_ptr(dpu_dma_of_match),
+	},
 };
