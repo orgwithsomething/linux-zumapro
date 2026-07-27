@@ -26,6 +26,23 @@
 			  <0xa 0x80000000 0x80000000>;
 	};
 
+	reserved-memory {
+		/*
+		 * DPU scanout is physically addressed while the SysMMU is kept
+		 * detached during bring-up.  Keep enough low memory for several
+		 * 1080x2424 buffers and constrain it to the IDMA's 32-bit range.
+		 */
+		linux_cma: linux,cma {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x08000000>;
+			/* "alignment" uses the parent's two address cells. */
+			alignment = <0x0 0x00400000>;
+			alloc-ranges = <0x0 0x80000000 0x80000000>;
+			linux,cma-default;
+		};
+	};
+
 	aoc_sound: aoc-sound {
 		compatible = "google,aoc-sound";
 		aoc = <&aoc>;
@@ -124,22 +141,24 @@
 	};
 };
 
-// &cont_splash_mem {
-// 	// reg = <0x0 0xfac00000 (1440 * 3120 * 4)>;
-// 	reg = <0x0 0xfac00000 (1080 * 2424 * 4)>;
-// 	status = "okay";
-// };
+&cont_splash_mem {
+	reg = <0x0 0xfac00000 (1080 * 2424 * 4)>;
+	/*
+	 * Keep the bootloader scanout valid when the DPUF0 SysMMU switches
+	 * from bypass to the Linux DMA domain. The direct IOVA mapping is
+	 * installed before the domain is attached.
+	 */
+	iommu-addresses = <&dpu_dma 0xfac00000 (1080 * 2424 * 4)>;
+	status = "okay";
+};
 
-// &framebuffer0 {
-// 	// width = <1440>;
-// 	// height = <3120>;
-// 	// stride = <(1440 * 4)>;
-// 	width = <1080>;
-// 	height = <2424>;
-// 	stride = <(1080 * 4)>;
-// 	format = "a8r8g8b8";
-// 	status = "okay";
-// };
+&framebuffer0 {
+	width = <1080>;
+	height = <2424>;
+	stride = <(1080 * 4)>;
+	format = "a8r8g8b8";
+	status = "okay";
+};
 
 &usi4 {
 	samsung,mode = <USI_MODE_I2C>;
@@ -166,15 +185,18 @@
 	};
 };
 
-/*
- * Production Tokay TK4C display. Unlike Komodo, this is 1080x2424 at a
- * 756 Mbps lane rate and uses the TK4C-specific DSC and command sequence.
- */
 &decon0 {
 	status = "okay";
 };
 
 &dpu_dma {
+	/*
+	 * GF0 is a DPUF0 fetch channel. The identity-mapped splash above
+	 * makes attaching its SysMMU safe while the bootloader is scanning
+	 * out; subsequent PRIME imports receive contiguous IOVAs.
+	 */
+	iommus = <&sysmmu_dpuf0>;
+	memory-region = <&cont_splash_mem>;
 	status = "okay";
 };
 

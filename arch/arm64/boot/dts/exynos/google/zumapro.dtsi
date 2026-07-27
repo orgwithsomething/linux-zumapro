@@ -4114,14 +4114,11 @@
 			clock-names = "aclk";
 			power-domains = <&pd_dpuf0>;
 			/*
-			 * The IDMA is the DPU's memory master. Route it through the
-			 * v9 DPU SysMMUs (mainline exynos-iommu gained v9 support),
-			 * so exynos DRM maps framebuffers into the IOMMU instead of
-			 * requiring physically contiguous CMA. Both DPUF SysMMUs are
-			 * listed because the IDMA channels span the two DPU fetch
-			 * blocks; #iommu-cells is 0 so no stream id is encoded here.
+			 * The board DT attaches the SysMMU for its active fetch
+			 * block and supplies a direct mapping for the bootloader
+			 * splash. Do not attach both DPUF SysMMUs here: switching
+			 * the live scanout to an empty DMA domain resets the device.
 			 */
-			iommus = <&sysmmu_dpuf0>, <&sysmmu_dpuf1>;
 			status = "disabled";
 		};
 
@@ -4171,7 +4168,7 @@
 			 */
 			pinctrl-names = "default";
 			pinctrl-0 = <&disp_te_pri_on>;
-			te-gpio = <&gpp0 3 0>;
+			te-gpios = <&gpp0 3 0>;
 
 			/*
 			 * port@0 is the DECON input. The panel output (port@1)
