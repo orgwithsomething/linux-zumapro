@@ -6,10 +6,9 @@
  *
  * The zuma DSIM is a newer IP generation than the mainline samsung-dsim
  * bridge (DSIM_LINK + integrated DCPHY, VERSION 0x02090100), so it needs its
- * own encoder. On every enable it brings the whole link up from scratch
- * (vendor dsim_reg_init): DCPHY PLL, lane training and the command-mode DSC
- * link config - it owns the link and does not depend on the bootloader having
- * configured it, so it works from a cold boot and across suspend/resume.
+ * own encoder. During boot handover it preserves the DCPHY/link configured by
+ * the bootloader, matching the vendor DSIM_STATE_HANDOVER path. A full cold
+ * DCPHY initialization remains available for bring-up testing.
  *
  * All panel-specific parameters are taken from the DRM mode (resolution,
  * refresh rate) and the attached MIPI-DSI device (lane count, HS bit rate,
@@ -22,6 +21,7 @@
 #include <linux/iopoll.h>
 #include <linux/math64.h>
 #include <linux/mfd/syscon.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -40,6 +40,11 @@
 
 /* fallback refresh rate until the first mode_set (any sane value works) */
 #define DSIM_DEFAULT_VREFRESH	60
+
+static bool zuma_dsim_force_cold_init;
+module_param_named(dsim_cold_init, zuma_dsim_force_cold_init, bool, 0444);
+MODULE_PARM_DESC(dsim_cold_init,
+		 "Reset and initialize the Zuma DCPHY instead of preserving bootloader handover");
 
 struct zuma_dsim {
 	struct device *dev;
@@ -661,12 +666,35 @@ static void zuma_dsim_configure(struct zuma_dsim *dsim)
 	u32 stable_vfp, te_protect, te_tout;
 	u32 vrefresh = dsim->vrefresh ? dsim->vrefresh : DSIM_DEFAULT_VREFRESH;
 	u32 hs_mbps = dsim->hs_clk_mbps;
+	int ret;
 
 	if (!dsim->regs || !hs_mbps || !dsim->hactive)
 		return;
 
-	/* Own the link: always bring the DCPHY/PLL/lanes up from scratch. */
-	zuma_dsim_cold_init(dsim);
+	if (zuma_dsim_force_cold_init) {
+		ret = zuma_dsim_cold_init(dsim);
+		if (ret) {
+			dev_err(dsim->dev, "cold DCPHY init failed: %d\n", ret);
+			return;
+		}
+		dev_notice(dsim->dev, "using cold DCPHY initialization\n");
+	} else {
+		/*
+		 * The bootloader is still scanning out the simple-framebuffer.
+		 * Preserve its trained DCPHY and live link just as the vendor
+		 * DSIM_STATE_HANDOVER path does.
+		 */
+		dev_notice(dsim->dev, "preserving bootloader DCPHY handover\n");
+	}
+
+	/*
+	 * Boot firmware can leave packet-go batching armed after its splash
+	 * update. Individual panel DCS writes would then accumulate in the
+	 * header FIFO forever waiting for PKT_GO_RDY.
+	 */
+	dsim_rmw(dsim, DSIM_CMD_CONFIG, 0,
+		 DSIM_CMD_CONFIG_PKT_GO_EN | DSIM_CMD_CONFIG_PKT_GO_RDY |
+		 DSIM_CMD_CONFIG_MULTI_CMD_PKT_EN);
 
 	/*
 	 * Command-mode transfer TE timing (vendor dsim_reg_set_config subset).
@@ -841,8 +869,14 @@ static ssize_t zuma_dsim_host_transfer(struct mipi_dsi_host *host,
 	ret = readl_poll_timeout_atomic(dsim->regs + DSIM_FIFOCTRL, val,
 					(val & mask) == mask, 10, 20000);
 	if (ret) {
-		dev_warn(dsim->dev, "cmd tx timeout (type 0x%02x, FIFOCTRL=0x%08x)\n",
-			 msg->type, val);
+		dev_warn(dsim->dev,
+			 "cmd tx timeout type=0x%02x FIFO=0x%08x DPHY=0x%08x CLK=0x%08x SWRST=0x%08x CMD=0x%08x INTSRC=0x%08x\n",
+			 msg->type, val,
+			 readl(dsim->regs + DSIM_DPHY_STATUS),
+			 readl(dsim->regs + DSIM_CLK_CTRL),
+			 readl(dsim->regs + DSIM_SWRST),
+			 readl(dsim->regs + DSIM_CMD_CONFIG),
+			 readl(dsim->regs + DSIM_INTSRC));
 		return ret;
 	}
 
