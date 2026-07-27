@@ -9,6 +9,7 @@
 
 #include <linux/component.h>
 #include <linux/dma-mapping.h>
+#include <linux/aperture.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/uaccess.h>
@@ -301,6 +302,16 @@ static int exynos_drm_bind(struct device *dev)
 
 	/* init kms poll for handling hpd */
 	drm_kms_helper_poll_init(drm);
+
+	/*
+	 * The firmware framebuffer and Exynos DRM drive the same display
+	 * aperture. Remove simpledrm before registering this device so fbcon
+	 * cannot keep rendering into the bootloader buffer after DECON has
+	 * switched to an Exynos framebuffer.
+	 */
+	ret = aperture_remove_all_conflicting_devices(DRIVER_NAME);
+	if (ret)
+		goto err_cleanup_poll;
 
 	/* register the DRM device */
 	ret = drm_dev_register(drm, 0);
