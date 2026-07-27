@@ -38,11 +38,8 @@ static int brcmf_sdiod_txglomsz = BRCMF_DEFAULT_TXGLOM_SIZE;
 module_param_named(txglomsz, brcmf_sdiod_txglomsz, int, 0);
 MODULE_PARM_DESC(txglomsz, "Maximum tx packet chain size [SDIO]");
 
-/* Debug level configuration. See debug.h for bits, sysfs modifiable.
- * Default to streaming the firmware console (FWCON) so the dongle's own
- * log reaches dmesg on every boot without a module argument.
- */
-int brcmf_msg_level = BRCMF_FWCON_VAL;
+/* Debug level configuration. See debug.h for bits, sysfs modifiable. */
+int brcmf_msg_level;
 module_param_named(debug, brcmf_msg_level, int, 0600);
 MODULE_PARM_DESC(debug, "Level of debug output");
 
@@ -203,7 +200,6 @@ struct brcmf_mp_global_t brcmf_mp_global;
 
 void brcmf_c_set_joinpref_default(struct brcmf_if *ifp)
 {
-	struct brcmf_pub *drvr = ifp->drvr;
 	struct brcmf_join_pref_params join_pref_params[2];
 	int err;
 
@@ -813,4 +809,3 @@ static void __exit brcmfmac_module_exit(void)
 
 module_init(brcmfmac_module_init);
 module_exit(brcmfmac_module_exit);
-
