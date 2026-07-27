@@ -50,10 +50,13 @@
 	aoc-board-rev = <0x10000>;
 };
 
-/* The common file leaves this wrapper disabled; Tokay uses it for the amps. */
+/*
+ * usi19 is the ALIVE/APM wrapper for spi_17 at 0x155e0000. The speaker
+ * control bus named spi_19 is under usi24 (HSI0 USI1) at 0x111c0000, and
+ * zumapro-pixel-common.dtsi already enables that wrapper in SPI mode.
+ */
 &usi19 {
-	samsung,mode = <USI_MODE_SPI>;
-	status = "okay";
+	status = "disabled";
 };
 
 /*
