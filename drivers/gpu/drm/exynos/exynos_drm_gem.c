@@ -341,7 +341,16 @@ int exynos_drm_gem_dumb_create(struct drm_file *file_priv,
 	 *	with DRM_IOCTL_MODE_CREATE_DUMB command.
 	 */
 
-	if (is_drm_iommu_supported(dev))
+	/*
+	 * The Exynos9 DPU IDMA consumes a single linear scanout address.
+	 * Keep dumb buffers physically contiguous even with an IOMMU: the
+	 * fbdev buffer already uses this path successfully, while page-backed
+	 * buffers allocated for kmsro produce damaged horizontal regions at
+	 * their backing-store boundaries.
+	 */
+	if (IS_ENABLED(CONFIG_DRM_EXYNOS9_DECON))
+		flags = EXYNOS_BO_CONTIG | EXYNOS_BO_WC;
+	else if (is_drm_iommu_supported(dev))
 		flags = EXYNOS_BO_NONCONTIG | EXYNOS_BO_WC;
 	else
 		flags = EXYNOS_BO_CONTIG | EXYNOS_BO_WC;
