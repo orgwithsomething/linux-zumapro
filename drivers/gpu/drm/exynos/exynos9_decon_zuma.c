@@ -623,15 +623,19 @@ static void zuma_reg_set_interrupts(u32 id, bool en)
 	zuma_reg_clear_int_all(id);
 
 	if (en) {
-		u32 val = ZD_INT_EN_FRAME_DONE | ZD_INT_EN_FRAME_START |
-			  ZD_INT_EN_EXTRA | ZD_INT_EN;
+		/*
+		 * exynos9_decon requests only DT interrupt 0 (frame_done).
+		 * Frame-start and extra are separate level IRQs on Zuma; enabling
+		 * them without handlers leaves an asserted interrupt behind and
+		 * can drive the system into an IRQ storm.
+		 */
+		u32 val = ZD_INT_EN_FRAME_DONE | ZD_INT_EN;
 
 		zd_main_write_mask(id, ZD_DECON_INT_EN, val, ZD_INT_EN_MASK);
-		zd_main_write(id, ZD_DECON_INT_EN_EXTRA,
-			      ZD_INT_EN_RESOURCE_CONFLICT | ZD_INT_EN_TIME_OUT);
+		zd_main_write(id, ZD_DECON_INT_EN_EXTRA, 0);
 	} else {
-		zd_main_write_mask(id, ZD_DECON_INT_EN, 0,
-				   ZD_INT_EN_EXTRA | ZD_INT_EN);
+		zd_main_write_mask(id, ZD_DECON_INT_EN, 0, ZD_INT_EN_MASK);
+		zd_main_write(id, ZD_DECON_INT_EN_EXTRA, 0);
 	}
 }
 
