@@ -103,9 +103,17 @@ static const struct drm_ioctl_desc exynos_ioctls[] = {
 
 DEFINE_DRM_GEM_FOPS(exynos_drm_driver_fops);
 
+/*
+ * A display-only Exynos instance must not expose a render node. Otherwise
+ * Mesa selects it instead of the separate GPU render node and EGL setup
+ * fails. G2D and IPP are the Exynos engines that make the render node useful.
+ */
 static const struct drm_driver exynos_drm_driver = {
 	.driver_features	= DRIVER_MODESET | DRIVER_GEM
-				  | DRIVER_ATOMIC | DRIVER_RENDER,
+				  | DRIVER_ATOMIC
+				  | ((IS_ENABLED(CONFIG_DRM_EXYNOS_G2D) ||
+				      IS_ENABLED(CONFIG_DRM_EXYNOS_IPP)) ?
+					     DRIVER_RENDER : 0),
 	.open			= exynos_drm_open,
 	.postclose		= exynos_drm_postclose,
 	.dumb_create		= exynos_drm_gem_dumb_create,
