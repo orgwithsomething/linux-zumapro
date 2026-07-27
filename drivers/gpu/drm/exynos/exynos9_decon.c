@@ -1859,8 +1859,14 @@ static int decon_probe(struct platform_device *pdev)
 	return component_add(dev, &decon_component_ops);
 }
 
+static void decon_remove(struct platform_device *pdev)
+{
+	component_del(&pdev->dev, &decon_component_ops);
+}
+
 struct platform_driver decon_driver = {
 	.probe		= decon_probe,
+	.remove		= decon_remove,
 	.driver		= {
 		.name	= "exynos9-decon",
 		.of_match_table = decon_driver_dt_match,

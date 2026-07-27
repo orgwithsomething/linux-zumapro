@@ -120,8 +120,14 @@ static int dpp_probe(struct platform_device *pdev)
 	return component_add(dev, &dpp_component_ops);
 }
 
+static void dpp_remove(struct platform_device *pdev)
+{
+	component_del(&pdev->dev, &dpp_component_ops);
+}
+
 struct platform_driver dpp_driver = {
 	.probe = dpp_probe,
+	.remove = dpp_remove,
 	.driver = {
 		   .name = "dpp",
 		   .of_match_table = dpp_of_match,
