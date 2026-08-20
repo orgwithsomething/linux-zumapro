@@ -87,7 +87,7 @@
 	height = <2424>;
 	stride = <(1080 * 4)>;
 	format = "a8r8g8b8";
-	status = "okay";
+	status = "disabled";
 };
 
 &spitouch {
