@@ -22,8 +22,8 @@
 
 	chosen {
 		/* Bootloader expects bootargs specified otherwise it crashes */
-		bootargs = "clk_ignore_unused pd_ignore_unused regulator_ignore_unused";
-		stdout-path = &serial_0;
+		bootargs = "clk_ignore_unused pd_ignore_unused regulator_ignore_unused reboot=warm panic=5";
+		/* stdout-path = &serial_0; */
 
 		/* Use display framebuffer as setup by bootloader */
 		framebuffer0: framebuffer@fac00000 {
