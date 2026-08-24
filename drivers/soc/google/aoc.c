@@ -1440,4 +1440,6 @@ static struct platform_driver aoc_driver = {
 module_platform_driver(aoc_driver);
 
 MODULE_DESCRIPTION("Google AOC coprocessor firmware loader");
+/* The ASoC card consumes services which only exist after AOC has booted. */
+MODULE_SOFTDEP("post: snd_soc_google_aoc");
 MODULE_LICENSE("GPL");
