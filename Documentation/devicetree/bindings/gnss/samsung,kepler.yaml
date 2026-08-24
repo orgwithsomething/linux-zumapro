@@ -38,11 +38,23 @@ properties:
     description:
       Host-to-receiver line, asserted by the host to signal that it is ready.
 
+  vdd-core-supply:
+    description: Regulator providing the receiver core supply.
+
+  vdd-rf-supply:
+    description: Regulator providing the receiver RF supply.
+
+  vdd-aux-supply:
+    description: Regulator providing the receiver auxiliary supply.
+
 required:
   - compatible
   - reg
   - gnss2ap-gpios
   - ap2gnss-gpios
+  - vdd-core-supply
+  - vdd-rf-supply
+  - vdd-aux-supply
 
 unevaluatedProperties: false
 
@@ -60,5 +72,8 @@ examples:
             spi-max-frequency = <3125000>;
             gnss2ap-gpios = <&gpa5 4 GPIO_ACTIVE_HIGH>;
             ap2gnss-gpios = <&gpp2 3 GPIO_ACTIVE_HIGH>;
+            vdd-core-supply = <&vdd_gnss_core>;
+            vdd-rf-supply = <&vdd_gnss_rf>;
+            vdd-aux-supply = <&vdd_gnss_aux>;
         };
     };

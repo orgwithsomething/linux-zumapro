@@ -156,6 +156,9 @@
 		gnss2ap-gpios = <&gpa5 4 GPIO_ACTIVE_HIGH>;
 		/* AP2GNSS_SPI_INT on gpp2-3, the host-ready line */
 		ap2gnss-gpios = <&gpp2 3 GPIO_ACTIVE_HIGH>;
+		vdd-core-supply = <&s_ldo9_reg>;
+		vdd-rf-supply = <&s_ldo10_reg>;
+		vdd-aux-supply = <&s_ldo11_reg>;
 
 		controller-data {
 			samsung,spi-feedback-delay = <0>;
