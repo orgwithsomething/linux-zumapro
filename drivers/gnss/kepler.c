@@ -32,6 +32,7 @@
 #include <linux/module.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
+#include <linux/regulator/consumer.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -61,6 +62,7 @@ struct kepler_gnss {
 
 	struct gpio_desc	*gnss2ap;	/* device->host, IRQ source */
 	struct gpio_desc	*ap2gnss;	/* host->device */
+	struct regulator_bulk_data *supplies;
 	int			irq;
 
 	struct completion	ready;
@@ -75,11 +77,18 @@ struct kepler_gnss {
 	 */
 	spinlock_t		irq_lock;
 	bool			irq_on;
-	bool			irq_on_suspend;
+	bool			port_open;
+	bool			suspended;
 
 	struct wakeup_source	*ws;
 
 	u8			rx_buf[KEPLER_RX_FRAME_MAX] __aligned(4);
+};
+
+static const struct regulator_bulk_data kepler_supplies[] = {
+	{ .supply = "vdd-core" },
+	{ .supply = "vdd-rf" },
+	{ .supply = "vdd-aux" },
 };
 
 static void kepler_irq_enable(struct kepler_gnss *kp)
@@ -87,7 +96,7 @@ static void kepler_irq_enable(struct kepler_gnss *kp)
 	unsigned long flags;
 
 	spin_lock_irqsave(&kp->irq_lock, flags);
-	if (!kp->irq_on) {
+	if (kp->port_open && !kp->suspended && !kp->irq_on) {
 		enable_irq(kp->irq);
 		kp->irq_on = true;
 	}
@@ -118,6 +127,8 @@ static void kepler_irq_disable_sync(struct kepler_gnss *kp)
 
 	if (was_on)
 		disable_irq(kp->irq);
+	else
+		synchronize_irq(kp->irq);
 }
 
 static int kepler_spi_recv(struct kepler_gnss *kp, void *rx, unsigned int len)
@@ -218,7 +229,17 @@ static irqreturn_t kepler_irq_thread(int irq, void *data)
 static int kepler_open(struct gnss_device *gdev)
 {
 	struct kepler_gnss *kp = gnss_get_drvdata(gdev);
+	int ret;
 
+	ret = regulator_bulk_enable(ARRAY_SIZE(kepler_supplies), kp->supplies);
+	if (ret) {
+		dev_err(&kp->spi->dev, "failed to enable supplies: %d\n", ret);
+		return ret;
+	}
+
+	spin_lock_irq(&kp->irq_lock);
+	kp->port_open = true;
+	spin_unlock_irq(&kp->irq_lock);
 	kepler_irq_enable(kp);
 
 	return 0;
@@ -227,8 +248,17 @@ static int kepler_open(struct gnss_device *gdev)
 static void kepler_close(struct gnss_device *gdev)
 {
 	struct kepler_gnss *kp = gnss_get_drvdata(gdev);
+	int ret;
 
+	spin_lock_irq(&kp->irq_lock);
+	kp->port_open = false;
+	spin_unlock_irq(&kp->irq_lock);
 	kepler_irq_disable_sync(kp);
+	gpiod_set_value(kp->ap2gnss, 0);
+
+	ret = regulator_bulk_disable(ARRAY_SIZE(kepler_supplies), kp->supplies);
+	if (ret)
+		dev_err(&kp->spi->dev, "failed to disable supplies: %d\n", ret);
 }
 
 static int kepler_write_raw(struct gnss_device *gdev,
@@ -327,6 +357,11 @@ static int kepler_probe(struct spi_device *spi)
 		return dev_err_probe(dev, PTR_ERR(kp->ap2gnss),
 				     "failed to get ap2gnss gpio\n");
 
+	ret = devm_regulator_bulk_get_const(dev, ARRAY_SIZE(kepler_supplies),
+					    kepler_supplies, &kp->supplies);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to get supplies\n");
+
 	kp->irq = gpiod_to_irq(kp->gnss2ap);
 	if (kp->irq < 0)
 		return dev_err_probe(dev, kp->irq, "no IRQ for gnss2ap\n");
@@ -378,9 +413,9 @@ static void kepler_remove(struct spi_device *spi)
 	struct kepler_gnss *kp = spi_get_drvdata(spi);
 
 	disable_irq_wake(kp->irq);
+	gnss_deregister_device(kp->gdev);
 	kepler_irq_disable_sync(kp);
 	gpiod_set_value(kp->ap2gnss, 0);
-	gnss_deregister_device(kp->gdev);
 	gnss_put_device(kp->gdev);
 	wakeup_source_unregister(kp->ws);
 }
@@ -389,8 +424,10 @@ static int kepler_suspend(struct device *dev)
 {
 	struct kepler_gnss *kp = dev_get_drvdata(dev);
 
-	kp->irq_on_suspend = kp->irq_on;
-	kepler_irq_disable_nosync(kp);
+	spin_lock_irq(&kp->irq_lock);
+	kp->suspended = true;
+	spin_unlock_irq(&kp->irq_lock);
+	kepler_irq_disable_sync(kp);
 
 	return 0;
 }
@@ -399,8 +436,10 @@ static int kepler_resume(struct device *dev)
 {
 	struct kepler_gnss *kp = dev_get_drvdata(dev);
 
-	if (kp->irq_on_suspend)
-		kepler_irq_enable(kp);
+	spin_lock_irq(&kp->irq_lock);
+	kp->suspended = false;
+	spin_unlock_irq(&kp->irq_lock);
+	kepler_irq_enable(kp);
 
 	return 0;
 }

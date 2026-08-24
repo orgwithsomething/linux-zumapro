@@ -75,6 +75,18 @@
 	/delete-property/ regulator-always-on;
 };
 
+&s_ldo9_reg {
+	/delete-property/ regulator-always-on;
+};
+
+&s_ldo10_reg {
+	/delete-property/ regulator-always-on;
+};
+
+&s_ldo11_reg {
+	/delete-property/ regulator-always-on;
+};
+
 /*
  * usi19 is the ALIVE/APM wrapper for spi_17 at 0x155e0000. The speaker
  * control bus named spi_19 is under usi24 (HSI0 USI1) at 0x111c0000, and
@@ -311,6 +323,9 @@
 		pinctrl-0 = <&gnss_spi_irq &gnss_spi_int>;
 		gnss2ap-gpios = <&gpa5 4 GPIO_ACTIVE_HIGH>;
 		ap2gnss-gpios = <&gpp2 3 GPIO_ACTIVE_HIGH>;
+		vdd-core-supply = <&s_ldo9_reg>;
+		vdd-rf-supply = <&s_ldo10_reg>;
+		vdd-aux-supply = <&s_ldo11_reg>;
 
 		controller-data {
 			samsung,spi-feedback-delay = <0>;
