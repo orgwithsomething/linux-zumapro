@@ -769,21 +769,45 @@
 		};
 
 		isp-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <0>;
 			thermal-sensors = <&tmu_sub 1>;
+
+			trips {
+				isp_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 
 		tpu-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <0>;
 			thermal-sensors = <&tmu_sub 2>;
+
+			trips {
+				tpu_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 
 		aur-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			polling-delay-passive = <0>;
 			thermal-sensors = <&tmu_sub 3>;
+
+			trips {
+				aur_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 	};
 
