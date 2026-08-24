@@ -157,7 +157,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a720";
 			reg = <0x0600>;
-			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL2>;
+			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_CPUCL1>;
 			enable-method = "psci";
 			cpu-idle-states = <&hunter_cpu_sleep>;
 			capacity-dmips-mhz = <850>;
