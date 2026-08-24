@@ -11,6 +11,7 @@
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
 #include <dt-bindings/soc/samsung_sysmmu_v9.h>
+#include <dt-bindings/thermal/thermal.h>
 
 
 / {
@@ -575,14 +576,17 @@
 	/*
 	 * The TMU is owned by the ACPM firmware and read over IPC via the
 	 * acpm_tmu sensor.  On a bare mainline boot the firmware only measures;
-	 * active throttling would need cpufreq cooling, so for now each CPU-
-	 * cluster zone carries only a critical trip that triggers an orderly
-	 * shutdown before the die reaches a damaging temperature.  The GPU/ISP/
-	 * TPU/AUR zones are monitor-only (polling-delay = 0, read on demand).
+	 * active CPU throttling would need a firmware-aware cpufreq driver, so
+	 * each CPU-cluster zone carries a critical trip that triggers an orderly
+	 * shutdown before the die reaches a damaging temperature.  Panthor does
+	 * provide devfreq cooling, so the GPU starts throttling at 90 C.  The
+	 * remaining firmware zones carry critical trips for the same last-resort
+	 * protection.  Poll slowly below the passive GPU trip to avoid needless
+	 * traffic on the shared ACPM mailbox.
 	 */
 	thermal-zones {
 		big-thermal {
-			polling-delay = <250>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 0>;
 
 			trips {
@@ -595,7 +599,7 @@
 		};
 
 		mid-thermal {
-			polling-delay = <250>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 1>;
 
 			trips {
@@ -608,7 +612,7 @@
 		};
 
 		little-thermal {
-			polling-delay = <250>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 2>;
 
 			trips {
@@ -621,23 +625,70 @@
 		};
 
 		g3d-thermal {
-			polling-delay = <0>;
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 3>;
+
+			trips {
+				g3d_passive: passive {
+					temperature = <90000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				g3d_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&g3d_passive>;
+					cooling-device = <&gpu THERMAL_NO_LIMIT
+							      THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 
 		isp-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 4>;
+
+			trips {
+				isp_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 
 		tpu-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 5>;
+
+			trips {
+				tpu_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 
 		aur-thermal {
-			polling-delay = <0>;
+			polling-delay = <1000>;
 			thermal-sensors = <&acpm_tmu 6>;
+
+			trips {
+				aur_crit: critical {
+					temperature = <115000>;
+					hysteresis = <1000>;
+					type = "critical";
+				};
+			};
 		};
 	};
 
