@@ -57,7 +57,6 @@
 		regulator-name = "cs35l41-vp";
 		regulator-min-microvolt = <3700000>;
 		regulator-max-microvolt = <3700000>;
-		regulator-always-on;
 	};
 };
 
@@ -65,6 +64,15 @@
 &aoc {
 	aoc-board-id = <0x40a02>;
 	aoc-board-rev = <0x10000>;
+};
+
+/*
+ * Let both amplifiers own Tokay's speaker rail. Keep accelerator rails pinned
+ * until the Tensor power-domain driver can physically gate the GPU and TPU
+ * domains; Panthor still models its SRAM supply while ACPM owns core voltage.
+ */
+&s_bucka_reg {
+	/delete-property/ regulator-always-on;
 };
 
 /*

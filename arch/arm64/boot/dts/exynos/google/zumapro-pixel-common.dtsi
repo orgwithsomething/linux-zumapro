@@ -199,7 +199,10 @@
 			};
 
 			s_buck8_reg: buck8s {
-				/* GPU */
+				/*
+				 * GPU L2 rail. Panthor only models the SRAM supply here;
+				 * ACPM owns the ASV-calibrated core and L2 voltages.
+				 */
 				regulator-name = "vdd_g3d_l2";
 				regulator-min-microvolt = <450000>;
 				regulator-max-microvolt = <1300000>;
