@@ -23,7 +23,7 @@
 
 	chosen {
 		/* Bootloader expects bootargs specified otherwise it crashes */
-		bootargs = "splash plymouth.ignore-serial-consoles plymouth.prefer-fbcon clk_ignore_unused regulator_ignore_unused pmos_boot_uuid=054e6c2a-294c-4542-be46-56ac95c6d2d9 pmos_root_uuid=738b808b-8486-42b8-9520-0cd5fa0e4ac7 pmos_rootfsopts=defaults reboot=warm panic=5";
+		bootargs = "splash plymouth.ignore-serial-consoles plymouth.prefer-fbcon pmos_boot_uuid=054e6c2a-294c-4542-be46-56ac95c6d2d9 pmos_root_uuid=738b808b-8486-42b8-9520-0cd5fa0e4ac7 pmos_rootfsopts=defaults reboot=warm panic=5";
 		/* stdout-path = &serial_0; */
 
 		/* Use display framebuffer as setup by bootloader */

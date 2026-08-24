@@ -145,3 +145,26 @@
 	};
 };
 
+
+/* Keep the modem powered down during Tokay bring-up. */
+&pcie_0_phy {
+	status = "disabled";
+};
+
+&pcie_0 {
+	status = "disabled";
+};
+
+&cp_power {
+	status = "disabled";
+};
+
+/ {
+	spmi {
+		status = "disabled";
+	};
+
+	modem {
+		status = "disabled";
+	};
+};
