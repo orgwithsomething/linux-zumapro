@@ -243,11 +243,11 @@
  * common to production Caimito-family phones.
  */
 &pcie_0_phy {
-	status = "okay";
+	status = "disabled";
 };
 
 &pcie_0 {
-	status = "okay";
+	status = "disabled";
 	pinctrl-0 = <&pcie0_clkreq &pcie0_perst>;
 	pinctrl-names = "default";
 	reset-gpios = <&gph0 0 GPIO_ACTIVE_HIGH>;
@@ -260,6 +260,7 @@
 		compatible = "google,bitbang-spmi-controller";
 		#address-cells = <2>;
 		#size-cells = <0>;
+		status = "disabled";
 		sclk-gpios = <&gpa3 2 GPIO_ACTIVE_HIGH>;
 		sdata-gpios = <&gpa3 3 GPIO_ACTIVE_HIGH>;
 		delay-us = <10>;
@@ -277,6 +278,7 @@
 
 	cp_power: cp-power {
 		compatible = "google,exynos-cp-power";
+		status = "disabled";
 		cp-pwr-gpios = <&gpp12 2 GPIO_ACTIVE_HIGH>;
 		cp-nreset-gpios = <&gpp12 3 GPIO_ACTIVE_HIGH>;
 		cp-pm-wrst-gpios = <&gpp8 3 GPIO_ACTIVE_HIGH>;
@@ -347,6 +349,7 @@
 
 	modem {
 		compatible = "samsung,s5300-modem";
+		status = "disabled";
 		memory-region = <&cp_rmem_reserved>, <&cp_msi_rmem_reserved>,
 				<&cp_pktproc_rmem_reserved>;
 		memory-region-names = "ipc", "msi", "pktproc";
