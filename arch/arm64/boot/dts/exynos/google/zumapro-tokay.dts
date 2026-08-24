@@ -168,3 +168,12 @@
 		status = "disabled";
 	};
 };
+
+/* Let the amplifiers own Tokay's speaker rail. */
+&cs35l41_vp {
+	/delete-property/ regulator-always-on;
+};
+
+&s_bucka_reg {
+	/delete-property/ regulator-always-on;
+};
