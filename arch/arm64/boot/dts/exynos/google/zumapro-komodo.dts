@@ -9,6 +9,7 @@
 
 #include "zumapro-pixel-common.dtsi"
 #include "zumapro-caimito-wireless.dtsi"
+#include <dt-bindings/leds/common.h>
 #include <dt-bindings/spmi/spmi.h>
 
 / {
@@ -156,6 +157,31 @@
 // 	format = "a8r8g8b8";
 // 	status = "okay";
 // };
+
+&usi4 {
+	samsung,mode = <USI_MODE_I2C>;
+	status = "okay";
+};
+
+&hsi2c_4 {
+	clock-frequency = <390000>;
+	status = "okay";
+
+	flash_led: led-controller@63 {
+		compatible = "ti,lm3644";
+		reg = <0x63>;
+		enable-gpios = <&gpp24 1 GPIO_ACTIVE_HIGH>;
+
+		led {
+			function = LED_FUNCTION_FLASH;
+			color = <LED_COLOR_ID_WHITE>;
+			led-sources = <0>, <1>;
+			led-max-microamp = <90000>;
+			flash-max-microamp = <750000>;
+			flash-max-timeout-us = <100000>;
+		};
+	};
+};
 
 /*
  * Display (DPU) bring-up for komodo.
