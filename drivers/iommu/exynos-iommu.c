@@ -891,7 +891,13 @@ static int exynos_sysmmu_probe(struct platform_device *pdev)
 
 	__sysmmu_get_version(data);
 
-	pm_runtime_put(dev);
+	/*
+	 * Finish the temporary runtime PM cycle before registering the IOMMU.
+	 * Once registered, of_xlate() may set data->master while a client probe
+	 * can still fail and free its dev->iommu state.  An asynchronous put
+	 * would let the suspend callback race with that transient association.
+	 */
+	pm_runtime_put_sync_suspend(dev);
 
 	if (!data->variant) {
 		ret = dev_err_probe(dev, -ENODEV,
