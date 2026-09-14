@@ -49,7 +49,7 @@
 };
 
 &decon_autorefresh_bit {
-	status = "okay";
+	status = "disabled";
 };
 
 &cont_splash_mem {
