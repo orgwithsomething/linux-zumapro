@@ -175,6 +175,13 @@ static const struct regmap_access_table max77779_charger_volatile_table = {
 	.n_yes_ranges = ARRAY_SIZE(max77779_charger_volatile_registers),
 };
 
+/*
+ * No cache. CHG_CNFG_09.CHGIN_ILIM is re-armed by the hardware's BC1.2
+ * autodetect on every CHGIN attach, and the protected CHG_CNFG_* registers
+ * silently drop writes while CHG_CNFG_06.CHGPROT is locked -- in both cases a
+ * cache would report back what the driver wrote rather than what the charger
+ * kept.
+ */
 static const struct regmap_config max77779_regmap_config_charger = {
 	.name = "charger",
 	.reg_bits = 8,
@@ -183,8 +190,7 @@ static const struct regmap_config max77779_regmap_config_charger = {
 	.wr_table = &max77779_charger_wr_table,
 	.rd_table = &max77779_charger_rd_table,
 	.volatile_table = &max77779_charger_volatile_table,
-	.num_reg_defaults_raw = MAX77779_CHGR_REG_CHG_CUST_TM + 1,
-	.cache_type = REGCACHE_FLAT,
+	.cache_type = REGCACHE_NONE,
 };
 
 static bool max77779_scratch_reg(struct device *dev, unsigned int reg)

@@ -18,8 +18,9 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
+#include "s5p_mfc_qos.h"
 #include "regs-mfc.h"
-#include "regs-mfc-v12.h"
+#include "regs-mfc-v16.h"
 
 #define S5P_MFC_NAME		"s5p-mfc"
 
@@ -78,6 +79,7 @@
 #define S5P_MFC_CODEC_H263_ENC		23
 #define S5P_MFC_CODEC_VP8_ENC		24
 #define S5P_MFC_CODEC_HEVC_ENC		26
+#define S5P_MFC_CODEC_VP9_ENC		27
 
 #define S5P_MFC_R2H_CMD_EMPTY			0
 #define S5P_MFC_R2H_CMD_SYS_INIT_RET		1
@@ -195,6 +197,13 @@ struct s5p_mfc_buf {
  */
 struct s5p_mfc_pm {
 	struct clk	*clock_gate;
+	struct clk	*rate_clock;
+	struct icc_path	*memory_path;
+	unsigned long	qos_rate;
+	u32		qos_avg_bw;
+	u32		qos_peak_bw;
+	u32		qos_tag;
+	bool		qos_dirty;
 	const char * const *clk_names;
 	struct clk	*clocks[MFC_MAX_CLOCKS];
 	int		num_clocks;
@@ -219,12 +228,38 @@ struct s5p_mfc_buf_size_v6 {
 	unsigned int other_enc_ctx;
 };
 
+/**
+ * struct s5p_mfc_raw_layout - memory layout of one raw frame
+ * @frame_width:	width of the frame the layout was made for
+ * @buf_width:		luma width in pixels after hardware alignment
+ * @buf_height:		rows in the luma plane, the visible height padded
+ * @stride:		bytes per line of each plane
+ * @luma_size:		size of the luma plane
+ * @chroma_size:	size of the chroma plane, or of the Cb plane
+ * @chroma_size_1:	size of the Cr plane of a three-plane format
+ */
+struct s5p_mfc_raw_layout {
+	unsigned int frame_width;
+	unsigned int buf_width;
+	unsigned int buf_height;
+	unsigned int stride[3];
+	unsigned int luma_size;
+	unsigned int chroma_size;
+	unsigned int chroma_size_1;
+};
+
 struct s5p_mfc_buf_size {
 	unsigned int fw;
 	unsigned int cpb;
 	const void *priv;
 };
 
+/**
+ * struct s5p_mfc_variant - per-SoC description of the codec block
+ * @enc_frmsize: raw and coded resolutions the encoder accepts
+ * @dec_frmsize: coded resolutions the decoder accepts, or NULL when the
+ *		 range is not known and ENUM_FRAMESIZES is left unsupported
+ */
 struct s5p_mfc_variant {
 	unsigned int version;
 	unsigned int port_num;
@@ -234,6 +269,8 @@ struct s5p_mfc_variant {
 	const char	*clk_names[MFC_MAX_CLOCKS];
 	int		num_clocks;
 	bool		use_clock_gating;
+	const struct v4l2_frmsize_stepwise *enc_frmsize;
+	const struct v4l2_frmsize_stepwise *dec_frmsize;
 };
 
 /**
@@ -286,6 +323,7 @@ struct s5p_mfc_priv_buf {
  * @ctx:		array of driver contexts
  * @curr_ctx:		number of the currently running context
  * @ctx_work_bits:	used to mark which contexts are waiting for hardware
+ * @open_ctxs:		every open context, whether or not it holds a slot
  * @watchdog_cnt:	counter for the watchdog
  * @watchdog_timer:	timer for the watchdog
  * @watchdog_workqueue:	workqueue for the watchdog
@@ -299,6 +337,7 @@ struct s5p_mfc_priv_buf {
  * @fw_ver:		loaded firmware sub-version
  * @fw_get_done:	flag set when request_firmware() is complete and
  *			copied into fw_buf
+ * @fw_failed:		firmware fault requiring all handles to close before restart
  * @risc_on:		flag indicates RISC is on or off
  *
  */
@@ -333,6 +372,7 @@ struct s5p_mfc_dev {
 	struct s5p_mfc_ctx *ctx[MFC_NUM_CONTEXTS];
 	int curr_ctx;
 	unsigned long ctx_work_bits;
+	struct list_head open_ctxs;
 	atomic_t watchdog_cnt;
 	struct timer_list watchdog_timer;
 	struct workqueue_struct *watchdog_workqueue;
@@ -346,6 +386,7 @@ struct s5p_mfc_dev {
 	const struct s5p_mfc_regs *mfc_regs;
 	enum s5p_mfc_fw_ver fw_ver;
 	bool fw_get_done;
+	bool fw_failed;
 	bool risc_on; /* indicates if RISC is on or off */
 };
 
@@ -418,9 +459,9 @@ struct s5p_mfc_mpeg4_enc_params {
 };
 
 /*
- * struct s5p_mfc_vp8_enc_params - encoding parameters for vp8
+ * struct s5p_mfc_vpx_enc_params - encoding parameters for VP8 and VP9
  */
-struct s5p_mfc_vp8_enc_params {
+struct s5p_mfc_vpx_enc_params {
 	u8 imd_4x4;
 	enum v4l2_vp8_num_partitions num_partitions;
 	enum v4l2_vp8_num_ref_frames num_ref;
@@ -435,6 +476,7 @@ struct s5p_mfc_vp8_enc_params {
 	u8 rc_frame_qp;
 	u8 rc_p_frame_qp;
 	u8 profile;
+	u8 vp9_level;
 };
 
 struct s5p_mfc_hevc_enc_params {
@@ -522,7 +564,7 @@ struct s5p_mfc_enc_params {
 	struct {
 		struct s5p_mfc_h264_enc_params h264;
 		struct s5p_mfc_mpeg4_enc_params mpeg4;
-		struct s5p_mfc_vp8_enc_params vp8;
+		struct s5p_mfc_vpx_enc_params vpx;
 		struct s5p_mfc_hevc_enc_params hevc;
 	} codec;
 
@@ -548,6 +590,7 @@ struct s5p_mfc_codec_ops {
  * struct s5p_mfc_ctx - This struct contains the instance context
  *
  * @dev:		pointer to the s5p_mfc_dev of the device
+ * @node:		link in the device's list of open contexts
  * @fh:			struct v4l2_fh
  * @num:		number of the context that this structure describes
  * @int_cond:		variable used by the waitqueue
@@ -568,11 +611,16 @@ struct s5p_mfc_codec_ops {
  * @inst_no:		number of hw instance associated with the context
  * @img_width:		width of the image that is decoded or encoded
  * @img_height:		height of the image that is decoded or encoded
+ * @frame_width:	width of the encoder's source frame as set, before
+ *			alignment; the OUTPUT format reports it
  * @buf_width:		width of the buffer for processed image
  * @buf_height:		height of the buffer for processed image
  * @luma_size:		size of a luma plane
  * @chroma_size:	size of a chroma plane
  * @mv_size:		size of a motion vectors buffer
+ * @luma_dpb_min:	the firmware's minimum luma DPB plane size, read at
+ *			SEQ_DONE on v16
+ * @chroma_dpb_min:	the firmware's minimum chroma DPB plane size
  * @consumed_stream:	number of bytes that have been used so far from the
  *			decoding buffer
  * @dpb_flush_flag:	flag used to indicate that a DPB buffers are being
@@ -591,7 +639,12 @@ struct s5p_mfc_codec_ops {
  * @dst_bufs_cnt:	number of allocated destination buffers
  * @sequence:		counter for the sequence number for v4l2
  * @dec_dst_flag:	flags for buffers queued in the hardware
+ * @dec_dpb_used:	bitmap of dynamic DPBs retained by the firmware
  * @dec_src_buf_size:	size of the buffer for source buffers in decoding
+ * @colorspace:		colorimetry set on OUTPUT and reported on both queues
+ * @xfer_func:		transfer function, with @colorspace
+ * @ycbcr_enc:		Y'CbCr encoding, with @colorspace
+ * @quantization:	quantization range, with @colorspace
  * @codec_mode:		number of codec mode used by MFC hw
  * @slice_interface:	slice interface flag
  * @loop_filter_mpeg4:	loop filter for MPEG4 flag
@@ -609,6 +662,11 @@ struct s5p_mfc_codec_ops {
  * @mv_count:		number of MV buffers allocated for decoding
  * @enc_params:		encoding parameters for MFC
  * @enc_dst_buf_size:	size of the buffers for encoder output
+ * @enc_dst_buf_size_req: coded buffer size the client asked for, 0 for the default
+ * @enc_eos_pending:	encoder drain is waiting for a terminal capture buffer
+ * @enc_seq_complete:	a LAST_FRAME ended the encoder's sequence; the next
+ *			frame needs a new header first
+ * @draining:		a STOP was issued and its terminal buffer is not out yet
  * @luma_dpb_size:	dpb buffer size for luma
  * @chroma_dpb_size:	dpb buffer size for chroma
  * @me_buffer_size:	size of the motion estimation buffer
@@ -630,7 +688,9 @@ struct s5p_mfc_codec_ops {
  */
 struct s5p_mfc_ctx {
 	struct s5p_mfc_dev *dev;
+	struct list_head node;
 	struct v4l2_fh fh;
+	struct s5p_mfc_qos qos;
 
 	int num;
 
@@ -658,6 +718,7 @@ struct s5p_mfc_ctx {
 	/* Image parameters */
 	int img_width;
 	int img_height;
+	int frame_width;
 	int buf_width;
 	int buf_height;
 
@@ -665,6 +726,8 @@ struct s5p_mfc_ctx {
 	int chroma_size;
 	int chroma_size_1;
 	int mv_size;
+	unsigned int luma_dpb_min;
+	unsigned int chroma_dpb_min;
 
 	unsigned long consumed_stream;
 
@@ -684,7 +747,12 @@ struct s5p_mfc_ctx {
 
 	unsigned int sequence;
 	unsigned long dec_dst_flag;
+	u32 dec_dpb_used;
 	size_t dec_src_buf_size;
+	enum v4l2_colorspace colorspace;
+	enum v4l2_xfer_func xfer_func;
+	enum v4l2_ycbcr_encoding ycbcr_enc;
+	enum v4l2_quantization quantization;
 
 	/* Control values */
 	int codec_mode;
@@ -704,8 +772,12 @@ struct s5p_mfc_ctx {
 	struct s5p_mfc_priv_buf shm;
 
 	struct s5p_mfc_enc_params enc_params;
+	bool enc_eos_pending;
+	bool enc_seq_complete;
+	bool draining;
 
 	size_t enc_dst_buf_size;
+	size_t enc_dst_buf_size_req;
 	size_t luma_dpb_size;
 	size_t chroma_dpb_size;
 	size_t me_buffer_size;
@@ -775,10 +847,13 @@ static inline struct s5p_mfc_ctx *file_to_ctx(struct file *filp)
 #define ctrl_to_ctx(__ctrl) \
 	container_of((__ctrl)->handler, struct s5p_mfc_ctx, ctrl_handler)
 
+void s5p_mfc_abort_firmware(struct s5p_mfc_dev *dev);
 void clear_work_bit(struct s5p_mfc_ctx *ctx);
 void set_work_bit(struct s5p_mfc_ctx *ctx);
 void clear_work_bit_irqsave(struct s5p_mfc_ctx *ctx);
 void set_work_bit_irqsave(struct s5p_mfc_ctx *ctx);
+int s5p_mfc_claim_ctx_slot(struct s5p_mfc_ctx *ctx);
+void s5p_mfc_release_ctx_slot(struct s5p_mfc_ctx *ctx);
 int s5p_mfc_get_new_ctx(struct s5p_mfc_dev *dev);
 void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 
@@ -790,6 +865,7 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 #define IS_MFCV8_PLUS(dev)	((dev)->variant->version >= 0x80)
 #define IS_MFCV10_PLUS(dev)	((dev)->variant->version >= 0xA0)
 #define IS_MFCV12(dev)		((dev)->variant->version >= 0xC0)
+#define IS_MFCV16_PLUS(dev)	((dev)->variant->version >= MFC_VERSION_V16)
 #define FW_HAS_E_MIN_SCRATCH_BUF(dev) (IS_MFCV10_PLUS(dev))
 
 #define MFC_V5_BIT	BIT(0)
@@ -798,6 +874,7 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 #define MFC_V8_BIT	BIT(3)
 #define MFC_V10_BIT	BIT(5)
 #define MFC_V12_BIT	BIT(7)
+#define MFC_V16_BIT	BIT(8)
 
 #define MFC_V5PLUS_BITS		(MFC_V5_BIT | MFC_V6_BIT | MFC_V7_BIT | \
 					MFC_V8_BIT | MFC_V10_BIT | MFC_V12_BIT)
@@ -807,5 +884,43 @@ void s5p_mfc_cleanup_queue(struct list_head *lh, struct vb2_queue *vq);
 					MFC_V12_BIT)
 
 #define MFC_V10PLUS_BITS	(MFC_V10_BIT | MFC_V12_BIT)
+
+/*
+ * v16 DPB plane sizes for a raw format: the firmware's single-buffer layout,
+ * grown to the minimum the firmware reported at SEQ_DONE only when the planes
+ * are separate buffers. A single buffer holds the chroma at bytesperline *
+ * height, so its luma plane cannot grow; the vendor driver skips the minimum
+ * for its single-buffer format too. The minimum is kept on the context because
+ * this also runs from S_FMT, with the registers stale and the clock off.
+ */
+static inline void s5p_mfc_dpb_plane_sizes_v16(const struct s5p_mfc_ctx *ctx,
+					       const struct s5p_mfc_fmt *fmt,
+					       int *luma, int *chroma)
+{
+	*luma = ctx->buf_width * ctx->buf_height;
+	*chroma = *luma / 2;
+	if (fmt->num_planes > 1) {
+		*luma = max_t(int, *luma, ctx->luma_dpb_min);
+		*chroma = max_t(int, *chroma, ctx->chroma_dpb_min);
+	}
+}
+
+/* DMA addresses of a raw frame's planes; a single buffer holds them all. */
+static inline void s5p_mfc_raw_plane_addrs(const struct s5p_mfc_ctx *ctx,
+					   const struct s5p_mfc_fmt *fmt,
+					   struct vb2_buffer *vb,
+					   unsigned long *y, unsigned long *c,
+					   unsigned long *c1)
+{
+	*y = vb2_dma_contig_plane_dma_addr(vb, 0);
+	*c1 = 0;
+	if (fmt->num_planes == 1) {
+		*c = *y + ctx->luma_size;
+		return;
+	}
+	*c = vb2_dma_contig_plane_dma_addr(vb, 1);
+	if (fmt->num_planes == 3)
+		*c1 = vb2_dma_contig_plane_dma_addr(vb, 2);
+}
 
 #endif /* S5P_MFC_COMMON_H_ */

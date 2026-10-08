@@ -25,7 +25,10 @@
 #include <linux/io.h>
 #include <linux/mod_devicetable.h>
 #include <linux/module.h>
+#include <linux/notifier.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 
 #define S2MPU_CTRL0				0x0
 #define S2MPU_V9_CFG_MPTW_ATTRIBUTE		0x10
@@ -53,27 +56,20 @@
 #define S2MPU_CTX_CFG_VALID(ctx)		BIT((4 * (ctx)) + 3)
 #define S2MPU_CTX_CFG_VID(ctx, vid)		(((u32)(vid) & 0x7) << (4 * (ctx)))
 
-static int exynos_s2mpu_probe(struct platform_device *pdev)
-{
-	struct device *dev = &pdev->dev;
-	u8 ctx_vid[S2MPU_NR_VIDS] = { };
-	unsigned int num_ctx, ctx, gb;
-	unsigned int vid_bmap;
+struct exynos_s2mpu {
 	void __iomem *base;
+	struct notifier_block genpd_nb;
+	unsigned int num_ctx;
+};
+
+static void exynos_s2mpu_install(struct exynos_s2mpu *s2mpu)
+{
+	void __iomem *base = s2mpu->base;
+	u8 ctx_vid[S2MPU_NR_VIDS] = { };
+	unsigned int num_ctx = s2mpu->num_ctx;
+	unsigned int ctx, gb;
+	unsigned int vid_bmap;
 	u32 ctx_cfg = 0;
-	u32 version;
-
-	base = devm_platform_ioremap_resource(pdev, 0);
-	if (IS_ERR(base))
-		return PTR_ERR(base);
-
-	version = readl_relaxed(base + S2MPU_VERSION);
-	num_ctx = readl_relaxed(base + S2MPU_NUM_CONTEXT) & S2MPU_NUM_CONTEXT_MASK;
-	if (!num_ctx) {
-		dev_warn(dev, "no MPT contexts (version %#x); leaving as-is\n",
-			 version);
-		return 0;
-	}
 
 	/*
 	 * Allocate a context id to each VID (in order), building the
@@ -113,12 +109,105 @@ static int exynos_s2mpu_probe(struct platform_device *pdev)
 	/* Flush the MPT cache and make all of the above visible. */
 	writel_relaxed(S2MPU_ALL_INVALIDATION_GO, base + S2MPU_ALL_INVALIDATION);
 	wmb();
+}
+
+/*
+ * The MPT lives in the DPU power domain and is lost every time it gates. genpd
+ * fires GENPD_NOTIFY_ON from genpd_power_on(), which genpd_runtime_resume()
+ * calls before resuming any device in the domain -- so the firewall is open
+ * again before the DPP, DECON or DMA controller can issue a transaction. genpd
+ * does not order peer devices, so a runtime_resume callback on this device
+ * would not be enough.
+ */
+static int exynos_s2mpu_genpd_notify(struct notifier_block *nb,
+				     unsigned long action, void *data)
+{
+	struct exynos_s2mpu *s2mpu = container_of(nb, struct exynos_s2mpu,
+						  genpd_nb);
+
+	if (action == GENPD_NOTIFY_ON)
+		exynos_s2mpu_install(s2mpu);
+
+	return NOTIFY_OK;
+}
+
+static int exynos_s2mpu_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct exynos_s2mpu *s2mpu;
+	u32 version;
+	int ret;
+
+	s2mpu = devm_kzalloc(dev, sizeof(*s2mpu), GFP_KERNEL);
+	if (!s2mpu)
+		return -ENOMEM;
+
+	s2mpu->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(s2mpu->base))
+		return PTR_ERR(s2mpu->base);
+
+	version = readl_relaxed(s2mpu->base + S2MPU_VERSION);
+	s2mpu->num_ctx = readl_relaxed(s2mpu->base + S2MPU_NUM_CONTEXT) &
+			 S2MPU_NUM_CONTEXT_MASK;
+	if (!s2mpu->num_ctx) {
+		dev_warn(dev, "no MPT contexts (version %#x); leaving as-is\n",
+			 version);
+		return 0;
+	}
+
+	platform_set_drvdata(pdev, s2mpu);
+	exynos_s2mpu_install(s2mpu);
+
+	/*
+	 * An always-on unit has no domain to watch, and dev_pm_genpd_add_notifier()
+	 * says -ENODEV for it.  That is not a failure: the permissive mapping is
+	 * already installed above, there is no power-down to lose it to, and
+	 * nothing needs re-installing until system sleep -- which resume_early
+	 * below covers.  Treating it as fatal left the unit open but the device
+	 * unbound, so anything naming it in access-controllers waited forever for
+	 * a supplier that would never be ready.
+	 */
+	s2mpu->genpd_nb.notifier_call = exynos_s2mpu_genpd_notify;
+	ret = dev_pm_genpd_add_notifier(dev, &s2mpu->genpd_nb);
+	if (ret == -ENODEV) {
+		dev_info(dev, "v9 allow-all installed, always-on (version %#x, %u contexts)\n",
+			 version, s2mpu->num_ctx);
+		return 0;
+	}
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot watch the power domain\n");
+
+	/*
+	 * Nothing here ever takes a reference: the unit has no clients of its
+	 * own, and the masters it guards keep the domain up while they run.
+	 * Enabling runtime PM is what lets the domain gate at all -- genpd
+	 * counts a device with runtime PM disabled as not-suspended, so leaving
+	 * it off vetoed every power-off for the whole domain.
+	 */
+	pm_runtime_enable(dev);
 
 	dev_info(dev, "v9 allow-all installed (version %#x, %u contexts)\n",
-		 version, num_ctx);
+		 version, s2mpu->num_ctx);
 
 	return 0;
 }
+
+/*
+ * Firmware resets these units to blocking across system sleep, and the genpd
+ * notifier above cannot cover the always-on ones: their domain never gates, so
+ * nothing fires.  Reinstall on resume_early, before any consumer's resume
+ * callback can issue a transaction -- consumers that name us in
+ * access-controllers are ordered after us, which is what that link is for here.
+ */
+static int __maybe_unused exynos_s2mpu_resume_early(struct device *dev)
+{
+	exynos_s2mpu_install(dev_get_drvdata(dev));
+	return 0;
+}
+
+static const struct dev_pm_ops exynos_s2mpu_pm_ops = {
+	.resume_early = exynos_s2mpu_resume_early,
+};
 
 static const struct of_device_id exynos_s2mpu_of_match[] = {
 	{ .compatible = "google,s2mpu-v9" },
@@ -131,6 +220,7 @@ static struct platform_driver exynos_s2mpu_driver = {
 	.driver	= {
 		.name		= "exynos-s2mpu",
 		.of_match_table	= exynos_s2mpu_of_match,
+		.pm		= pm_sleep_ptr(&exynos_s2mpu_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 };

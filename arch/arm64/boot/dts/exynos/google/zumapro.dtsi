@@ -8,6 +8,7 @@
 #include <dt-bindings/clock/google,zuma.h>
 #include <dt-bindings/clock/google,zuma-acpm.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interconnect/google,zumapro.h>
 #include <dt-bindings/interrupt-controller/arm-gic.h>
 #include <dt-bindings/soc/samsung,exynos-usi.h>
 #include <dt-bindings/soc/samsung_sysmmu_v9.h>
@@ -46,12 +47,15 @@
 				core0 {
 					cpu = <&cpu0>;
 				};
+
 				core1 {
 					cpu = <&cpu1>;
 				};
+
 				core2 {
 					cpu = <&cpu2>;
 				};
+
 				core3 {
 					cpu = <&cpu3>;
 				};
@@ -61,9 +65,11 @@
 				core0 {
 					cpu = <&cpu4>;
 				};
+
 				core1 {
 					cpu = <&cpu5>;
 				};
+
 				core2 {
 					cpu = <&cpu6>;
 				};
@@ -910,6 +916,42 @@
 		// 	rmem_index = <3>;
 		// };
 
+		/*
+		 * Framebuffers.  The DPU's dumb buffers are allocated physically
+		 * contiguous because a scattered one still corrupts the panel, so
+		 * each is one run the size of a screen -- 16 MiB at komodo's
+		 * 1344x2992.  Out of the global CMA those runs stopped being
+		 * assemblable once the GPU, the AoC and Wi-Fi had pinned pages
+		 * through it: the allocation failed with -EBUSY, having nothing to
+		 * do with how many pages were free.  Give the DPU a pool of its
+		 * own, which they do not allocate from.
+		 *
+		 * reusable, so movable allocations still use it while the display
+		 * is not, and placed by the kernel rather than pinned to an
+		 * address, since nothing requires it to be anywhere particular.
+		 */
+		dpu_fb_pool: dpu-fb-pool {
+			compatible = "shared-dma-pool";
+			reusable;
+			size = <0x08000000>;		/* 128 MiB: 8 screens */
+			alignment = <0x00400000>;
+		};
+
+		/*
+		 * The codec's RISC addresses everything relative to the
+		 * firmware it is given, and can only reach 0xf0000000 bytes
+		 * past it.  Keep the firmware in the last 1 MiB below 256 MiB
+		 * so every later buffer sits above it and still inside that
+		 * window: reserve the 255 MiB underneath and the top 1 MiB of
+		 * the 32-bit space so the DMA allocator cannot place a buffer
+		 * there.  This describes device addresses only, so the node
+		 * carries no reg and needs no memory of its own.
+		 */
+		mfc_firmware_iova: mfc-firmware-iova {
+			iommu-addresses = <&mfc 0x00000000 0x0ff00000>,
+					  <&mfc 0xfff00000 0x00100000>;
+		};
+
 		pstore: ramoops@fd3ff000 {
 			compatible = "ramoops";
 			reg = <0 0xfd3ff000 0x400000>;
@@ -944,205 +986,221 @@
 		 * SoC.  Mark both always-on to adopt the live state until the
 		 * off-sequence is implemented.
 		 */
-		pd_g3d: pd-g3d@15461A80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461A80 0x20>;
-			cal_id = <0xB1380000>;
-			need_smc = <0x1EE10204>;
-			cmu_id = <0x1EE00000>;
-			status = "okay";
-			skip-idle-ip;
+		pd_g3d: power-domain@15461a80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461a80 0x20>,
+			      <0x1ee00000 0x10000>,
+			      <0x1ee20000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1ee10204>;
 			samsung,always-on;
 			#power-domain-cells = <0>;
+			label = "G3D";
 		};
-		pd_embedded_g3d: pd-embedded_g3d@15461C80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461C80 0x20>;
-			cal_id = <0xB1380001>;
-			status = "okay";
+		pd_embedded_g3d: power-domain@15461c80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461c80 0x40>,
+			      <0x1ee00000 0x10000>;
+			reg-names = "pmu", "cmu";
 			power-domains = <&pd_g3d>;
 			samsung,always-on;
 			#power-domain-cells = <0>;
+			label = "G3D_CORES";
 		};
-		pd_dpub: pd-dpub@15461D00 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461D00 0x20>;
-			cal_id = <0xB1380002>;
-			need_smc = <0x19410204>;
-			cmu_id = <0x19400000>;
-			status = "okay";
+		pd_dpub: power-domain@15461d00 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461d00 0x20>,
+			      <0x19400000 0x10000>,
+			      <0x19420000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x19410204>;
 			#power-domain-cells = <0>;
-			skip-idle-ip;
+			label = "DPUB";
 		};
-		pd_dpuf0: pd-dpuf0@15461D80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461D80 0x20>;
-			cal_id = <0xB1380003>;
-			need_smc = <0x19810204>;
-			cmu_id = <0x19800000>;
-			status = "okay";
+		pd_dpuf0: power-domain@15461d80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461d80 0x20>,
+			      <0x19800000 0x8000>,
+			      <0x19820000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x19810204>;
 			power-domains = <&pd_dpub>;
 			#power-domain-cells = <0>;
-			skip-idle-ip;
+			label = "DPUF0";
 		};
-		pd_dpuf1: pd-dpuf1@15461E00 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461E00 0x20>;
-			cal_id = <0xB1380004>;
-			need_smc = <0x19C10204>;
-			cmu_id = <0x19C00000>;
-			status = "okay";
+		pd_dpuf1: power-domain@15461e00 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461e00 0x20>,
+			      <0x19c00000 0x8000>,
+			      <0x19c20000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x19c10204>;
 			power-domains = <&pd_dpub>;
 			#power-domain-cells = <0>;
-			skip-idle-ip;
+			label = "DPUF1";
 		};
-		pd_g2d: pd-g2d@15461E80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461E80 0x20>;
-			cal_id = <0xB1380005>;
-			need_smc = <0x1A810204>;
-			cmu_id = <0x1A800000>;
-			status = "okay";
+		pd_g2d: power-domain@15461e80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461e80 0x20>,
+			      <0x1a800000 0x10000>,
+			      <0x1a820000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1a810204>;
 			#power-domain-cells = <0>;
+			label = "G2D";
 		};
-		pd_gdc: pd-gdc@15461F00 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461F00 0x20>;
-			cal_id = <0xB1380006>;
-			need_smc = <0x1D410204>;
-			cmu_id = <0x1D400000>;
-			status = "okay";
+		pd_gdc: power-domain@15461f00 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461f00 0x20>,
+			      <0x1d400000 0x10000>,
+			      <0x1d420000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1d410204>;
 			#power-domain-cells = <0>;
+			label = "GDC";
 		};
-		pd_gse: pd-gse@15461F80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15461F80 0x20>;
-			cal_id = <0xB1380007>;
-			need_smc = <0x1D810204>;
-			cmu_id = <0x1D800000>;
-			status = "okay";
+		pd_gse: power-domain@15461f80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15461f80 0x20>,
+			      <0x1d800000 0x10000>,
+			      <0x1d820000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1d810204>;
 			#power-domain-cells = <0>;
+			label = "GSE";
 		};
-		pd_mcsc: pd-mcsc@15462000 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462000 0x20>;
-			cal_id = <0xB1380008>;
-			need_smc = <0x1D010204>;
-			cmu_id = <0x1D000000>;
-			status = "okay";
+		pd_mcsc: power-domain@15462000 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462000 0x20>,
+			      <0x1d000000 0x10000>,
+			      <0x1d020000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1d010204>;
 			#power-domain-cells = <0>;
+			label = "MCSC";
 		};
-		pd_mfc: pd-mfc@15462080 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462080 0x20>;
-			cal_id = <0xB1380009>;
-			need_smc = <0x1A410204>;
-			cmu_id = <0x1A400000>;
-			status = "okay";
+		pd_mfc: power-domain@15462080 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462080 0x20>,
+			      <0x1a400000 0x10000>,
+			      <0x1a420000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1a410204>;
 			#power-domain-cells = <0>;
+			label = "MFC";
 		};
-		pd_rgbp: pd-rgbp@15462100 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462100 0x20>;
-			cal_id = <0xB138000A>;
-			need_smc = <0x1C410204>;
-			cmu_id = <0x1C400000>;
-			status = "okay";
+		pd_rgbp: power-domain@15462100 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462100 0x20>,
+			      <0x1c400000 0x10000>,
+			      <0x1c420000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1c410204>;
 			#power-domain-cells = <0>;
+			label = "RGBP";
 		};
-		pd_tnr: pd-tnr@15462180 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462180 0x20>;
-			cal_id = <0xB138000B>;
-			need_smc = <0x1CC10204>;
-			cmu_id = <0x1CC00000>;
-			status = "okay";
+		pd_tnr: power-domain@15462180 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462180 0x20>,
+			      <0x1cc00000 0x10000>,
+			      <0x1cc20000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1cc10204>;
 			#power-domain-cells = <0>;
+			label = "TNR";
 		};
-		pd_yuvp: pd-yuvp@15462200 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462200 0x20>;
-			cal_id = <0xB138000C>;
-			need_smc = <0x1C810204>;
-			cmu_id = <0x1C800000>;
-			status = "okay";
+		pd_yuvp: power-domain@15462200 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462200 0x20>,
+			      <0x1c800000 0x10000>,
+			      <0x1c820000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1c810204>;
 			#power-domain-cells = <0>;
+			label = "YUVP";
 		};
-		pd_aoc: pd-aoc@15462280 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462280 0x20>;
-			cal_id = <0xB138000D>;
-			need_smc = <0x19010204>;
-			cmu_id = <0x19000000>;
+		pd_aoc: power-domain@15462280 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462280 0x20>,
+			      <0x19000000 0x10000>;
+			reg-names = "pmu", "cmu";
+			samsung,secure-pd-id = <0x19010204>;
+			samsung,always-on;
+			#power-domain-cells = <0>;
+			label = "AOC";
 			status = "disabled";
-			#power-domain-cells = <0>;
 		};
-		pd_aur: pd-aur@15462300 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462300 0x20>;
-			cal_id = <0xB138000E>;
-			need_smc = <0x20A10204>;
-			cmu_id = <0x20A00000>;
-			status = "okay";
+		pd_aur: power-domain@15462300 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462300 0x20>,
+			      <0x20a00000 0x10000>,
+			      <0x20a40000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x20a10204>;
 			#power-domain-cells = <0>;
+			label = "AUR";
 		};
-		pd_bw: pd-bw@15462380 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462380 0x20>;
-			cal_id = <0xB138000F>;
-			need_smc = <0x1A610204>;
-			cmu_id = <0x1A600000>;
-			status = "okay";
+		pd_bw: power-domain@15462380 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462380 0x20>,
+			      <0x1a600000 0x10000>,
+			      <0x1a620000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1a610204>;
 			#power-domain-cells = <0>;
+			label = "BW";
 		};
-		pd_eh: pd-eh@15462400 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462400 0x20>;
-			cal_id = <0xB1380010>;
-			need_smc = <0x16C10204>;
-			cmu_id = <0x16C00000>;
-			status = "okay";
-			skip-idle-ip;
+		pd_eh: power-domain@15462400 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462400 0x20>,
+			      <0x16c00000 0x10000>,
+			      <0x16c20000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x16c10204>;
 			#power-domain-cells = <0>;
+			label = "EH";
 		};
-		pd_ispfe: pd-ispfe@15462480 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462480 0x20>;
-			cal_id = <0xB1380011>;
-			need_smc = <0x1C010204>;
-			cmu_id = <0x1C000000>;
-			status = "okay";
+		pd_ispfe: power-domain@15462480 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462480 0x20>,
+			      <0x1c000000 0x10000>,
+			      <0x1c020000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1c010204>;
 			#power-domain-cells = <0>;
+			label = "ISPFE";
 		};
-		pd_tpu: pd-tpu@15462500 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462500 0x20>;
-			cal_id = <0xB1380012>;
-			need_smc = <0x1A310204>;
-			cmu_id = <0x1A300000>;
-			status = "okay";
+		pd_tpu: power-domain@15462500 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462500 0x20>,
+			      <0x1a300000 0x10000>,
+			      <0x1a320000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x1a310204>;
 			#power-domain-cells = <0>;
+			label = "TPU";
 		};
-		pd_hsi0: pd-hsi0@15462A80 {
-			compatible = "google,gs101-pd";
-			reg = <0x15462A80 0x20>;
-			cal_id = <0xB1380018>;
-			need_smc = <0x11010204>;
-			cmu_id = <0x11000000>;
-			status = "okay";
+		pd_hsi0: power-domain@15462a80 {
+			compatible = "google,zumapro-pd";
+			reg = <0x15462a80 0x20>,
+			      <0x11000000 0x10000>,
+			      <0x11020000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x11010204>;
 			#power-domain-cells = <0>;
-			power-down-ok = <0x3>;
-			skip-idle-ip;
+			label = "HSI0";
 		};
-		pd_hsi1: pd-hsi1@15462B00 {
+		pd_hsi1: power-domain@15462b00 {
 			/* BLK_HSI1: modem PCIe CH0 root complex (Gen3 x2) */
-			compatible = "google,gs101-pd";
-			reg = <0x15462B00 0x20>;
-			cal_id = <0xB1380019>;
-			need_smc = <0x12010204>;
-			cmu_id = <0x12000000>;
-			status = "okay";
+			compatible = "google,zumapro-pd";
+			reg = <0x15462b00 0x20>,
+			      <0x12000000 0x10000>,
+			      <0x12020000 0x1000>;
+			reg-names = "pmu", "cmu", "sysreg";
+			samsung,secure-pd-id = <0x12010204>;
+			samsung,always-on;
 			#power-domain-cells = <0>;
+			label = "HSI1";
 		};
 
 		efuse@10000000 {
@@ -2059,6 +2117,29 @@
 			pmmu1,default_stream = <STR_CFG(STR_SPTLB(0x00, 0x00), S2_EN, BL8, PREF_PRED, STLB_NONE, PTLB_NONE)>;
 		};
 
+		/*
+		 * The Multi Format Codec: hardware video encode and decode,
+		 * driven as a V4L2 mem2mem device.  Its firmware is loaded
+		 * through the IOMMU, it votes memory bandwidth through the NoC
+		 * QoS ports, and the second clock is the firmware-controlled
+		 * ACPM domain that sets the block's operating point.
+		 */
+		mfc: codec@1a4d0000 {
+			compatible = "google,zumapro-mfc";
+			reg = <0x1a4d0000 0x10000>;
+			interrupts = <GIC_SPI 515 IRQ_TYPE_LEVEL_HIGH 0>;
+			clocks = <&cmu_mfc CLK_GOUT_MFC_MFC_ACLK>,
+				 <&acpm_ipc GS101_CLK_ACPM_DVFS_MFC>;
+			clock-names = "mfc", "sclk_mfc";
+			interconnects = <&bts ZUMAPRO_BTS_MASTER_MFC
+					 &bts ZUMAPRO_BTS_SLAVE_MIF>;
+			interconnect-names = "memory";
+			power-domains = <&pd_mfc>;
+			iommus = <&sysmmu_mfc>;
+			memory-region = <&mfc_firmware_iova>;
+			status = "disabled";
+		};
+
 		sysmmu_mcsc: iommu@1D0A0000 {
 			compatible = "samsung,exynos-sysmmu";
 			reg = <0x1D0A0000 0x10000>;
@@ -2533,6 +2614,7 @@
 			interrupts = <GIC_SPI 767 IRQ_TYPE_LEVEL_HIGH 0>;
 			samsung,syscon-phandle = <&pmu_system_controller>;
 			samsung,cluster-index = <0>;
+
 			status = "disabled";
 		};
 
@@ -2545,6 +2627,7 @@
 			interrupts = <GIC_SPI 768 IRQ_TYPE_LEVEL_HIGH 0>;
 			samsung,syscon-phandle = <&pmu_system_controller>;
 			samsung,cluster-index = <1>;
+
 			status = "disabled";
 		};
 
@@ -2615,6 +2698,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_0>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1000>;
+
 			status = "disabled";
 
 			hsi2c_1: i2c@10880000 {
@@ -2629,6 +2713,7 @@
 				interrupts = <GIC_SPI 642 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c1_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2642,6 +2727,7 @@
 				pinctrl-0 = <&uart1_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2656,6 +2742,7 @@
 				interrupts = <GIC_SPI 642 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi1_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2670,6 +2757,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_1>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1004>;
+
 			status = "disabled";
 
 			hsi2c_2: i2c@10890000 {
@@ -2684,6 +2772,7 @@
 				interrupts = <GIC_SPI 643 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c2_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2697,6 +2786,7 @@
 				pinctrl-0 = <&uart2_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2711,6 +2801,7 @@
 				interrupts = <GIC_SPI 643 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi2_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2725,6 +2816,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_2>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1008>;
+
 			status = "disabled";
 
 			hsi2c_3: i2c@108a0000 {
@@ -2739,6 +2831,7 @@
 				interrupts = <GIC_SPI 644 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c3_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2752,6 +2845,7 @@
 				pinctrl-0 = <&uart3_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2766,6 +2860,7 @@
 				interrupts = <GIC_SPI 644 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi3_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2780,6 +2875,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_3>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x100c>;
+
 			status = "disabled";
 
 			hsi2c_4: i2c@108b0000 {
@@ -2794,6 +2890,7 @@
 				interrupts = <GIC_SPI 645 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c4_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2807,6 +2904,7 @@
 				pinctrl-0 = <&uart4_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2821,6 +2919,7 @@
 				interrupts = <GIC_SPI 645 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi4_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2835,6 +2934,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_4>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1010>;
+
 			status = "disabled";
 
 			hsi2c_5: i2c@108c0000 {
@@ -2849,6 +2949,7 @@
 				interrupts = <GIC_SPI 646 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c5_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2862,6 +2963,7 @@
 				pinctrl-0 = <&uart5_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2876,6 +2978,7 @@
 				interrupts = <GIC_SPI 646 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi5_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2890,6 +2993,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_5>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1014>;
+
 			status = "disabled";
 
 			hsi2c_6: i2c@108d0000 {
@@ -2904,6 +3008,7 @@
 				interrupts = <GIC_SPI 647 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c6_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -2917,6 +3022,7 @@
 				pinctrl-0 = <&uart6_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -2931,6 +3037,7 @@
 				interrupts = <GIC_SPI 647 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi6_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -2946,6 +3053,7 @@
 		// 		 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_6>;
 		// 	clock-names = "pclk", "ipclk";
 		// 	samsung,sysreg = <&sysreg_peric0 0x1018>;
+
 		// 	status = "disabled";
   //
 		// 	hsi2c_7: i2c@10960000 {
@@ -2960,6 +3068,7 @@
 		// 		interrupts = <GIC_SPI 648 IRQ_TYPE_LEVEL_HIGH 0>;
 		// 		pinctrl-0 = <&hsi2c7_bus>;
 		// 		pinctrl-names = "default";
+
 		// 		status = "disabled";
 		// 	};
   //
@@ -2973,6 +3082,7 @@
 		// 		pinctrl-0 = <&uart7_bus_single>;
 		// 		pinctrl-names = "default";
 		// 		samsung,uart-fifosize = <64>;
+
 		// 		status = "disabled";
 		// 	};
   //
@@ -2987,6 +3097,7 @@
 		// 		interrupts = <GIC_SPI 648 IRQ_TYPE_LEVEL_HIGH 0>;
 		// 		pinctrl-0 = <&spi7_bus>;
 		// 		pinctrl-names = "default";
+
 		// 		status = "disabled";
 		// 	};
 		// };
@@ -3001,6 +3112,7 @@
 		// 		 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP0_IPCLK_7>;
 		// 	clock-names = "pclk", "ipclk";
 		// 	samsung,sysreg = <&sysreg_peric0 0x101c>;
+
 		// 	status = "disabled";
   //
 		// 	hsi2c_8: i2c@10970000 {
@@ -3015,6 +3127,7 @@
 		// 		interrupts = <GIC_SPI 649 IRQ_TYPE_LEVEL_HIGH 0>;
 		// 		pinctrl-0 = <&hsi2c8_bus>;
 		// 		pinctrl-names = "default";
+
 		// 		status = "disabled";
 		// 	};
   //
@@ -3028,6 +3141,7 @@
 		// 		pinctrl-0 = <&uart8_bus_single>;
 		// 		pinctrl-names = "default";
 		// 		samsung,uart-fifosize = <64>;
+
 		// 		status = "disabled";
 		// 	};
   //
@@ -3042,6 +3156,7 @@
 		// 		interrupts = <GIC_SPI 649 IRQ_TYPE_LEVEL_HIGH 0>;
 		// 		pinctrl-0 = <&spi8_bus>;
 		// 		pinctrl-names = "default";
+
 		// 		status = "disabled";
 		// 	};
 		// };
@@ -3057,6 +3172,7 @@
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1020>;
 			samsung,mode = <USI_MODE_UART>;
+
 			status = "disabled";
 
 			serial_0: serial@10870000 {
@@ -3069,6 +3185,7 @@
 				pinctrl-0 = <&uart0_bus>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <256>;
+
 				status = "disabled";
 			};
 		};
@@ -3083,6 +3200,7 @@
 				 <&cmu_peric0 CLK_GOUT_PERIC0_PERIC0_TOP1_IPCLK_2>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric0 0x1028>;
+
 			status = "disabled";
 
 			hsi2c_14: i2c@10980000 {
@@ -3097,6 +3215,7 @@
 				interrupts = <GIC_SPI 648 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c14_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3110,6 +3229,7 @@
 				pinctrl-0 = <&uart14_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3124,6 +3244,7 @@
 				interrupts = <GIC_SPI 648 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi14_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3163,6 +3284,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_1>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1000>;
+
 			status = "disabled";
 
 			hsi2c_0: i2c@10c80000 {
@@ -3177,6 +3299,7 @@
 				interrupts = <GIC_SPI 656 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c0_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3190,6 +3313,7 @@
 				pinctrl-0 = <&uart0_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3204,6 +3328,7 @@
 				interrupts = <GIC_SPI 656 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi0_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3218,6 +3343,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_2>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1004>;
+
 			status = "disabled";
 
 			hsi2c_9: i2c@10c90000 {
@@ -3232,6 +3358,7 @@
 				interrupts = <GIC_SPI 657 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c9_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3245,6 +3372,7 @@
 				pinctrl-0 = <&uart9_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3259,6 +3387,7 @@
 				interrupts = <GIC_SPI 657 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi9_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3273,6 +3402,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_3>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1008>;
+
 			status = "disabled";
 
 			hsi2c_10: i2c@10ca0000 {
@@ -3287,6 +3417,7 @@
 				interrupts = <GIC_SPI 658 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c10_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3300,6 +3431,7 @@
 				pinctrl-0 = <&uart10_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3314,6 +3446,7 @@
 				interrupts = <GIC_SPI 658 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi10_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3328,6 +3461,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_4>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x100c>;
+
 			status = "disabled";
 
 			hsi2c_11: i2c@10cb0000 {
@@ -3342,6 +3476,7 @@
 				interrupts = <GIC_SPI 659 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c11_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3355,6 +3490,7 @@
 				pinctrl-0 = <&uart11_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3369,6 +3505,7 @@
 				interrupts = <GIC_SPI 659 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi11_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3383,6 +3520,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_5>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1010>;
+
 			status = "disabled";
 
 			hsi2c_12: i2c@10cc0000 {
@@ -3397,6 +3535,7 @@
 				interrupts = <GIC_SPI 660 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c12_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3410,6 +3549,7 @@
 				pinctrl-0 = <&uart12_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3424,6 +3564,7 @@
 				interrupts = <GIC_SPI 660 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi12_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3438,6 +3579,7 @@
 				 <&cmu_peric1 CLK_GOUT_PERIC1_PERIC1_TOP0_IPCLK_6>;
 			clock-names = "pclk", "ipclk";
 			samsung,sysreg = <&sysreg_peric1 0x1014>;
+
 			status = "disabled";
 
 			hsi2c_13: i2c@10cd0000 {
@@ -3452,6 +3594,7 @@
 				interrupts = <GIC_SPI 661 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&hsi2c13_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 
@@ -3465,6 +3608,7 @@
 				pinctrl-0 = <&uart13_bus_single>;
 				pinctrl-names = "default";
 				samsung,uart-fifosize = <64>;
+
 				status = "disabled";
 			};
 
@@ -3479,6 +3623,7 @@
 				interrupts = <GIC_SPI 661 IRQ_TYPE_LEVEL_HIGH 0>;
 				pinctrl-0 = <&spi13_bus>;
 				pinctrl-names = "default";
+
 				status = "disabled";
 			};
 		};
@@ -3541,6 +3686,7 @@
 		cmu_hsi0: clock-controller@11000000 {
 			compatible = "google,zuma-cmu-hsi0";
 			reg = <0x11000000 0x10000>;
+			power-domains = <&pd_hsi0>;
 			#clock-cells = <1>;
 
 			clocks = <&ext_24_5m>,
@@ -3557,6 +3703,21 @@
 			compatible = "google,gs101-hsi0-sysreg", "syscon";
 			reg = <0x11020000 0x10000>;
 			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_SYSREG_HSI0_PCLK>;
+		};
+
+		/*
+		 * The USB controller's DMA firewall.  Out of reset an S2MPU
+		 * blocks its master outright, and pd_hsi0 gates, so the unit
+		 * returns to that state whenever the domain is powered down -
+		 * the driver's power-on notifier reinstalls the table before
+		 * anything in the domain resumes.  The device describes this
+		 * one with neither a power domain nor always-on, which would
+		 * leave it programmed once and then lost on the first gate.
+		 */
+		s2mpu_s0_hsi0: s2mpu@11070000 {
+			compatible = "google,s2mpu-v9";
+			reg = <0x11070000 0x10000>;
+			power-domains = <&pd_hsi0>;
 		};
 
 		/*
@@ -3615,19 +3776,111 @@
 			phys = <&usb_hsphy>;
 			phy-names = "hs";
 			samsung,pmu-syscon = <&pmu_system_controller>;
+
 			status = "disabled";
+		};
+
+		/*
+		 * DisplayPort transmitter. Only the link registers are mapped
+		 * here: the vendor node also claims 0x11130000 and 0x11140000,
+		 * but those are the combo PHY's PMA and TCA, which usbdrd31_phy
+		 * above already maps and programs.
+		 *
+		 * The lanes reach the connector through that PHY, which TCPM
+		 * switches on DP alt mode entry, and AUX through the SBU switch
+		 * in the TCPC. Neither is this node's to describe.
+		 */
+		dp: displayport@110f0000 {
+			compatible = "samsung,exynos910-dp";
+			reg = <0x110f0000 0x6000>;
+			reg-names = "link_base";
+			interrupts = <GIC_SPI 389 IRQ_TYPE_LEVEL_HIGH 0>;
+			/*
+			 * The SuperSpeed half of the USB-C combo PHY. The lanes
+			 * are shared with USB3, so the link asks for rate, lane
+			 * count and drive levels through the phy framework
+			 * rather than mapping the PHY itself.
+			 */
+			phys = <&usbdrd31_phy 1>;
+			phy-names = "dp_phy";
+			/*
+			 * DPOSC and the APB clock. The vendor node names only
+			 * DPOSC because their CAL layer drives PCLK through the
+			 * Q-channel (QCH_CON_DP_LINK_QCH_PCLK); mainline's CCF
+			 * has no such path, and clk_summary shows
+			 * gout_hsi0_dp_link_i_pclk gated, so an unclaimed PCLK
+			 * means the first register access takes the SoC down.
+			 */
+			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_DP_LINK_I_DP_OSC_CLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_DP_LINK_I_PCLK>;
+			clock-names = "dposc", "pclk";
+			/*
+			 * The link wants DPOSC at 40MHz; the vendor asserts it
+			 * and the AUX bit timers, the HPD deglitch count and
+			 * the GTC counter are all derived from it.
+			 *
+			 * CMU_TOP already has the chain set up and divided down
+			 * to 39.936MHz (shared2_div2 / 10); only this user mux
+			 * sits on oscclk, so the link has been running at
+			 * 24.576MHz. Reparenting it needs the corrected
+			 * CMU_TOP offsets, since the gate feeding it shares
+			 * 0x20b8 with what clk-zuma called HSI1_BUS.
+			 */
+			assigned-clocks = <&cmu_hsi0 CLK_MOUT_HSI0_DPOSC_USER>;
+			assigned-clock-parents = <&cmu_top CLK_DOUT_CMU_HSI0_DPOSC>;
+			/*
+			 * Deliberately NOT reparented onto the CMU_TOP DPOSC
+			 * divider, though that is the 40 MHz the link wants.
+			 * clk-zuma puts mout_cmu_hsi0_usb31drd on TOP 0x1090
+			 * and gout_cmu_hsi1_bus on 0x20b8, which the vendor
+			 * CMU tables say are DPOSC's own mux and gate -- so
+			 * walking up that chain reprograms the register a live
+			 * USB or PCIe clock believes is its own, and the SoC
+			 * resets. Fix those offsets before reparenting.
+			 * Until then DPOSC runs from oscclk at 24.576 MHz.
+			 */
+			power-domains = <&pd_hsi0>;
+
+			status = "disabled";
+
+			/*
+			 * One endpoint per SST stream, and the endpoint's reg
+			 * *is* the stream index: the driver looks the CRTC up
+			 * with of_graph_get_endpoint_by_regs(node, 0, sst) for
+			 * sst in DP_SST_1..DP_SST_4, and reads the id back out
+			 * as the stream in exynos_drm_dp_get_sst_idx(). An
+			 * unnumbered endpoint is stream 0, which is
+			 * DP_SST_UNKNOWN and matches nothing, so the encoder
+			 * ends up with possible_crtcs = 0.
+			 */
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					dp_in: endpoint@1 {
+						reg = <1>;	/* SST1 */
+						remote-endpoint = <&decon1_out>;
+					};
+				};
+			};
 		};
 
 		usbdrd31: usb@11210000 {
 			compatible = "google,zuma-dwusb3", "google,gs101-dwusb3";
 			ranges = <0x0 0x11210000 0x10000>;
 			clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USB31DRD_BUS_CLK_EARLY>,
-				<&cmu_hsi0 CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_SUSPEND_CLK_26>,
-				<&cmu_hsi0 CLK_GOUT_HSI0_UASC_HSI0_LINK_ACLK>,
-				<&cmu_hsi0 CLK_GOUT_HSI0_UASC_HSI0_LINK_PCLK>;
+				 <&cmu_hsi0 CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_SUSPEND_CLK_26>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_UASC_HSI0_LINK_ACLK>,
+				 <&cmu_hsi0 CLK_GOUT_HSI0_UASC_HSI0_LINK_PCLK>;
 			clock-names = "bus_early", "susp_clk", "link_aclk", "link_pclk";
 			#address-cells = <1>;
 			#size-cells = <1>;
+
 			status = "disabled";
 
 			usbdrd31_dwc3: usb@0 {
@@ -3641,6 +3894,20 @@
 				snps,has-lpm-erratum;
 				snps,dis_u2_susphy_quirk;
 				snps,dis_u3_susphy_quirk;
+				/*
+				 * Link and gadget power management as the
+				 * vendor runs it on this silicon: no NYET
+				 * threshold, no USB2 gadget LPM, no
+				 * free-running USB2 PHY clock to fall back
+				 * on, and the host left out of initiating U1
+				 * or U2.
+				 */
+				snps,lpm-nyet-threshold = <0>;
+				snps,usb2-gadget-lpm-disable;
+				snps,dis-u2-freeclk-exists-quirk;
+				snps,dis-u1-entry-quirk;
+				snps,dis-u2-entry-quirk;
+
 				status = "disabled";
 			};
 		};
@@ -3665,6 +3932,22 @@
 			clock-names = "oscclk", "bus", "pcie";
 			samsung,sysreg = <&sysreg_hsi1>;
 			power-domains = <&pd_hsi1>;
+		};
+
+		/*
+		 * HSI1's stage-2 protection unit, in front of the modem's PCIe
+		 * root complex.  Unlike the DPU and AoC units this one is
+		 * always on, so the genpd notifier that reopens those never
+		 * fires for it -- firmware resets it to blocking across system
+		 * sleep and nothing would reopen it.  The root complex names it
+		 * in access-controllers so the resume order is right: without
+		 * it the CP's first shared-memory DMA after resume faults, and
+		 * the CP stops consuming its queue while the link looks healthy.
+		 */
+		s2mpu_s0_hsi1: s2mpu@12090000 {
+			compatible = "google,s2mpu-v9";
+			reg = <0x12090000 0x10000>;
+			#access-controller-cells = <0>;
 		};
 
 		sysreg_hsi1: syscon@12020000 {
@@ -3758,6 +4041,7 @@
 				 <&cmu_hsi1 CLK_GOUT_HSI1_PCIE_GEN3_0_PIPE_PAL_APB_PCLK>;
 			phys = <&pcie_0_phy>;
 			phy-names = "pcie-phy";
+			access-controllers = <&s2mpu_s0_hsi1>;
 			samsung,pmu-syscon = <&pmu_system_controller>;
 			samsung,pmu-offset = <0x3ec4>;
 			samsung,perst-delay-us = <15000>;
@@ -3831,7 +4115,6 @@
 				 <&cmu_hsi2 CLK_GOUT_HSI2_SYSREG_HSI2_PCLK>;
 			clock-names = "core_clk", "sclk_unipro_main", "fmp",
 				      "aclk", "pclk", "sysreg";
-			power-domains = <&pd_hsi0>;
 			dma-coherent;
 			freq-table-hz = <0 0>, <0 0>, <0 0>, <0 0>, <0 0>, <0 0>;
 			pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
@@ -3839,6 +4122,7 @@
 			phys = <&ufs_0_phy>;
 			phy-names = "ufs-phy";
 			samsung,sysreg = <&sysreg_hsi2 0x710>;
+
 			status = "disabled";
 		};
 
@@ -3850,7 +4134,7 @@
 			#phy-cells = <0>;
 			clocks = <&ext_24_5m>;
 			clock-names = "ref_clk";
-			power-domains = <&pd_hsi0>;
+
 			status = "disabled";
 		};
 
@@ -4137,6 +4421,7 @@
 
 			wakeup-interrupt-controller {
 				compatible = "google,zuma-wakeup-eint",
+					     "google,zumapro-wakeup-eint",
 					     "google,gs101-wakeup-eint",
 					     "samsung,exynos850-wakeup-eint",
 					     "samsung,exynos7-wakeup-eint";
@@ -4151,6 +4436,7 @@
 
 			wakeup-interrupt-controller {
 				compatible = "google,zuma-wakeup-eint",
+					     "google,zumapro-wakeup-eint",
 					     "google,gs101-wakeup-eint",
 					     "samsung,exynos850-wakeup-eint",
 					     "samsung,exynos7-wakeup-eint";
@@ -4220,12 +4506,14 @@
 			/* TODO: update once support for this CMU exists */
 			clocks = <0>;
 			clock-names = "pclk";
+
 			status = "disabled";
 		};
 
 		cmu_dpu: clock-controller@19400000 {
 			compatible = "google,zuma-cmu-dpu";
 			reg = <0x19400000 0x10000>;
+			power-domains = <&pd_dpub>;
 			#clock-cells = <1>;
 
 			clocks = <&ext_26m>,
@@ -4266,6 +4554,8 @@
 			clocks = <&cmu_dpu CLK_GOUT_DPU_DECON0_ACLK>;
 			clock-names = "aclk";
 			power-domains = <&pd_dpuf0>;
+			decon,id = <0>;
+			dpps = <&dpp0>;
 			/*
 			 * The DECON is the CRTC/blender/output block; it issues no
 			 * framebuffer DMA of its own. Memory reads are done by the
@@ -4288,6 +4578,47 @@
 		};
 
 		/*
+		 * The DP pipe. caiman puts DP on DECON1 rather than the SoC
+		 * default of DECON2 (vendor zuma-caimito-display.dtsi enables
+		 * drmdecon1 with connector = <0x10> and disables drmdecon2).
+		 * Only "main" and "wincon" differ from decon0; the window and
+		 * sub blocks are shared between the two.
+		 */
+		decon1: decon@19471000 {
+			compatible = "google,zuma-decon";
+			reg = <0x19471000 0x6000>,	/* main   */
+			      <0x19480000 0xe000>,	/* win    */
+			      <0x19490000 0x10000>,	/* sub    */
+			      <0x194b0000 0xe000>;	/* wincon */
+			reg-names = "main", "win", "sub", "wincon";
+			/* index 0 is the frame-done interrupt used by the driver */
+			interrupts = <GIC_SPI 247 IRQ_TYPE_LEVEL_HIGH 0>, /* frame_done */
+				     <GIC_SPI 248 IRQ_TYPE_LEVEL_HIGH 0>, /* frame_start */
+				     <GIC_SPI 246 IRQ_TYPE_LEVEL_HIGH 0>; /* extra */
+			interrupt-names = "frame_done", "frame_start", "extra";
+			/* one ACLK_DECON gate serves the whole DPUB block */
+			clocks = <&cmu_dpu CLK_GOUT_DPU_DECON0_ACLK>;
+			clock-names = "aclk";
+			power-domains = <&pd_dpuf0>;
+			decon,id = <1>;
+			dpps = <&dpp1>;
+
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					decon1_out: endpoint {
+						remote-endpoint = <&dp_in>;
+					};
+				};
+			};
+		};
+
+		/*
 		 * DPU IDMA channel array (channels at 0x1000 stride from the
 		 * base). The exynosautov9 DPU-DMA driver drives the GF0 channel
 		 * (channel_map[0] = 5 -> base + 0x5000 = 0x19905000).
@@ -4295,6 +4626,7 @@
 		dpu_dma: dma-controller@19900000 {
 			compatible = "samsung,exynosauto-dpu-dma";
 			reg = <0x19900000 0x9000>;
+			memory-region = <&dpu_fb_pool>;
 			interrupts = <GIC_SPI 261 IRQ_TYPE_LEVEL_HIGH 0>; /* IDMA GF0 (ch5) */
 			clocks = <&cmu_dpu CLK_GOUT_DPU_DECON0_ACLK>;
 			clock-names = "aclk";
@@ -4312,13 +4644,25 @@
 		};
 
 		/*
-		 * DPP processing block for the GF0 channel. The driver accesses
-		 * regs + 0x1000, so the region base is one channel stride below
-		 * the GF0 DPP block (0x19935000) to land on it.
+		 * DPP processing blocks, one per fetch channel. "dpp,id" is the
+		 * physical DPU channel and indexes all three blocks that make up
+		 * the channel: this DPP (0x19930000 + id * 0x1000), the IDMA in
+		 * dpu_dma (0x19900000 + id * 0x1000), and the DECON's WIN_CHMAP.
 		 */
-		dpp0: dpp@19934000 {
+		dpp0: dpp@19935000 {
 			compatible = "samsung,exynosauto-dpp";
-			reg = <0x19934000 0x2000>;
+			reg = <0x19935000 0x1000>;	/* GF0 */
+			dpp,id = <5>;
+			clocks = <&cmu_dpu CLK_GOUT_DPU_DECON0_ACLK>;
+			clock-names = "aclk";
+			power-domains = <&pd_dpuf0>;
+			status = "disabled";
+		};
+
+		dpp1: dpp@19936000 {
+			compatible = "samsung,exynosauto-dpp";
+			reg = <0x19936000 0x1000>;	/* GF1 */
+			dpp,id = <6>;
 			clocks = <&cmu_dpu CLK_GOUT_DPU_DECON0_ACLK>;
 			clock-names = "aclk";
 			power-domains = <&pd_dpuf0>;
@@ -4377,6 +4721,33 @@
 			};
 		};
 
+		/*
+		 * The video codec's own CMU.  Disabled: a board turns it on
+		 * together with the codec.
+		 */
+		cmu_mfc: clock-controller@1a400000 {
+			compatible = "google,zuma-cmu-mfc";
+			reg = <0x1a400000 0x10000>;
+			#clock-cells = <1>;
+			clocks = <&ext_24_5m>,
+				 <&cmu_top CLK_DOUT_CMU_MFC_MFC>;
+			clock-names = "oscclk", "bus";
+			power-domains = <&pd_mfc>;
+			samsung,sysreg = <&sysreg_mfc>;
+			status = "disabled";
+		};
+
+		/*
+		 * CMU_MFC reaches this only while the domain is active, so it
+		 * names no clock: a reference here would pin the runtime-PM
+		 * clock provider on for as long as the syscon exists.
+		 */
+		sysreg_mfc: syscon@1a420000 {
+			compatible = "google,zuma-mfc-sysreg", "syscon";
+			reg = <0x1a420000 0x1000>;
+			status = "disabled";
+		};
+
 		cmu_top: clock-controller@26040000 {
 			compatible = "google,zuma-cmu-top";
 			reg = <0x26040000 0x10000>;
@@ -4384,6 +4755,23 @@
 
 			clocks = <&ext_24_5m>;
 			clock-names = "oscclk";
+		};
+
+		/*
+		 * The NoC QoS ports in front of the codec's two memory masters.
+		 * An interconnect provider rather than a driver-private poke, so
+		 * the codec's bandwidth request composes with whatever else votes
+		 * on MIF and INT.  Offsets from the downstream Zuma BTS tables.
+		 */
+		bts: interconnect@26c48380 {
+			compatible = "google,zumapro-bts";
+			reg = <0x26c48380 0x80>, <0x26c48400 0x80>;
+			reg-names = "mfc0", "mfc1";
+			clocks = <&acpm_ipc GS101_CLK_ACPM_DVFS_MIF>,
+				 <&acpm_ipc GS101_CLK_ACPM_DVFS_INT>;
+			clock-names = "mif", "int";
+			#interconnect-cells = <1>;
+			status = "disabled";
 		};
 		
 		/*
@@ -4403,6 +4791,20 @@
 			compatible = "google,s2mpu-v9";
 			reg = <0x19c70000 0x10000>;
 			power-domains = <&pd_dpuf1>;
+		};
+
+		/*
+		 * The video codec's DMA firewall.  pd_mfc is off until a client
+		 * opens the codec, so the unit comes up at its reset state -
+		 * blocking every access - each time the domain is powered.  The
+		 * driver's power-on notifier runs before the codec resumes, so
+		 * the allow-all table is in place by the time the RISC fetches
+		 * its firmware.
+		 */
+		s2mpu_s0_mfc: s2mpu@1a4a0000 {
+			compatible = "google,s2mpu-v9";
+			reg = <0x1a4a0000 0x10000>;
+			power-domains = <&pd_mfc>;
 		};
 		
 		gpu: gpu@1f000000 {

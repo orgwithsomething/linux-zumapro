@@ -5,8 +5,10 @@
  * MAXIM TCPCI based TCPC driver
  */
 
+#include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/i2c.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/regmap.h>
@@ -15,6 +17,9 @@
 #include <linux/usb/tcpci.h>
 #include <linux/usb/tcpm.h>
 #include <linux/usb/typec.h>
+#include <linux/usb/typec_altmode.h>
+#include <linux/usb/typec_dp.h>
+#include <linux/usb/typec_mux.h>
 
 #include "tcpci_maxim.h"
 
@@ -221,11 +226,72 @@ static int get_vbus_regulator_handle(struct max_tcpci_chip *chip)
 	return 0;
 }
 
+/*
+ * tVBUSON: the longest a source may take to bring VBUS up to vSafe5V. The
+ * wait below is bounded by it, and 4.75V is what the sink is entitled to
+ * measure at the connector once the rail is up.
+ */
+#define MAX_TCPCI_VBUS_ON_TIMEOUT_MS	275
+#define MAX_TCPCI_VBUS_ON_POLL_MS	5
+#define MAX_TCPCI_VSAFE5V_MIN_MV	4750
+
 static void max_tcpci_sourcing_vbus_work(struct work_struct *work)
 {
 	struct max_tcpci_chip *chip = container_of(work, struct max_tcpci_chip,
 						   sourcing_vbus_work);
+	unsigned long timeout;
+	int mv = 0;
+	int ret;
+	u16 raw;
 
+	/*
+	 * tcpm takes this notification as "the rail is up" and starts sourcing
+	 * capabilities over it, so it must not be raised while the boost is
+	 * still ramping: the partner browns out mid-attach, and the heavier it
+	 * loads the rail the more certainly it does. The external boost cannot
+	 * report readiness itself, but it feeds the connector's VBUS pin and
+	 * the TCPC's own monitor can see that, so wait until the pin measures
+	 * vSafe5V before saying so.
+	 */
+	timeout = jiffies + msecs_to_jiffies(MAX_TCPCI_VBUS_ON_TIMEOUT_MS);
+	for (;;) {
+		ret = max_tcpci_read16(chip, TCPC_VBUS_VOLTAGE, &raw);
+		if (ret < 0) {
+			dev_warn(chip->dev, "sourcing VBUS: cannot measure: %d\n",
+				 ret);
+			break;
+		}
+
+		mv = (raw & TCPC_VBUS_VOLTAGE_MASK) * TCPC_VBUS_VOLTAGE_LSB_MV;
+		if (mv >= MAX_TCPCI_VSAFE5V_MIN_MV)
+			break;
+
+		if (!time_before(jiffies, timeout)) {
+			dev_warn(chip->dev,
+				 "sourcing VBUS: only %d mV after %d ms\n",
+				 mv, MAX_TCPCI_VBUS_ON_TIMEOUT_MS);
+			break;
+		}
+
+		/*
+		 * Only bail if tcpm has since asked us to stop sourcing, in
+		 * which case it is no longer waiting for this and the
+		 * notification is stale. Anything else must still be answered:
+		 * tcpm arms PD_T_PS_SOURCE_ON on entering SRC_ATTACHED and
+		 * falls back to SRC_UNATTACHED if this call never lands, so
+		 * swallowing it makes the port attach and detach forever.
+		 */
+		if (!READ_ONCE(chip->vbus_enabled))
+			return;
+
+		msleep(MAX_TCPCI_VBUS_ON_POLL_MS);
+	}
+
+	/*
+	 * Announced even when the rail never came up: a source that cannot
+	 * reach vSafe5V is a hardware fault, and withholding this would turn
+	 * it into a silent failure to attach rather than a logged one.
+	 */
 	tcpm_sourcing_vbus(chip->port);
 }
 
@@ -260,26 +326,39 @@ static int max_tcpci_set_vbus(struct tcpci *tcpci, struct tcpci_data *tdata, boo
 		return source ? ret : 1;
 	}
 
+	/*
+	 * Track our own enable state rather than probing the regulator. Its
+	 * is_enabled reports the hardware - the TCPC's EXT_BST_EN readback -
+	 * while the core counts users, and gating enable() on the hardware
+	 * view desynchronises the two the moment a disable() reports failure:
+	 * the count stays up, every later enable() is skipped as redundant,
+	 * and VBUS never comes back.
+	 */
 	if (source) {
-		if (!regulator_is_enabled(chip->vbus_reg))
+		if (!chip->vbus_enabled) {
 			ret = regulator_enable(chip->vbus_reg);
-		if (ret >= 0)
-			/*
-			 * The "vbus" regulator is an external boost the TCPC
-			 * cannot sense, so its POWER_STATUS never reports
-			 * SOURCING_VBUS and tcpm would otherwise time out the
-			 * source attach. Tell tcpm explicitly that VBUS is up.
-			 * Deferred to a work item: tcpm calls set_vbus() with
-			 * its port lock held, and tcpm_sourcing_vbus() retakes
-			 * it.
-			 */
-			schedule_work(&chip->sourcing_vbus_work);
-	} else {
-		if (regulator_is_enabled(chip->vbus_reg))
-			ret = regulator_disable(chip->vbus_reg);
+			if (ret < 0)
+				return ret;
+			WRITE_ONCE(chip->vbus_enabled, true);
+		}
+
+		/*
+		 * The "vbus" regulator is an external boost whose source switch
+		 * the TCPC does not drive, so POWER_STATUS never reports
+		 * SOURCING_VBUS and tcpm would otherwise time out the source
+		 * attach. Tell it explicitly, from a work item: tcpm calls
+		 * set_vbus() with its port lock held and tcpm_sourcing_vbus()
+		 * retakes it, and the rail has to be waited for besides.
+		 */
+		schedule_work(&chip->sourcing_vbus_work);
+	} else if (chip->vbus_enabled) {
+		WRITE_ONCE(chip->vbus_enabled, false);
+		ret = regulator_disable(chip->vbus_reg);
+		if (ret < 0)
+			return ret;
 	}
 
-	return ret < 0 ? ret : 1;
+	return 1;
 }
 
 static void process_power_status(struct max_tcpci_chip *chip)
@@ -336,6 +415,97 @@ static void max_tcpci_set_partner_usb_comm_capable(struct tcpci *tcpci, struct t
 
 	if (ret < 0)
 		dev_err(chip->dev, "Failed to enable USB switches");
+}
+
+/*
+ * The same USB switches as a connector state, for ports that never learn the
+ * partner's USB_COMM bit.  That bit only arrives with a PD contract, so on a
+ * pd-disable port the switches would be turned off at port reset and never
+ * turned back on.  TCPM drives TYPEC_STATE_USB from tcpm_set_roles() on every
+ * attach and TYPEC_STATE_SAFE from tcpm_reset_port() on every detach,
+ * independently of PD, which is the signal a non-PD port does get.
+ */
+/*
+ * Route the connector's SBU pair to the SoC's DP AUX lines, and raise the
+ * pull-up rail to the 3.3V AUX wants while they are routed. The max77759 path
+ * is already corrected for the plug orientation, so there is no polarity to
+ * choose here.
+ *
+ * Without this AUX never reaches the sink, and a DP partner that is otherwise
+ * fully negotiated -- mode entered, lanes muxed, HPD asserted -- can never be
+ * link trained.
+ */
+static int max_tcpci_sbu_switch(struct max_tcpci_chip *chip, bool dp)
+{
+	int ret;
+
+	if (chip->sbu_reg && dp != chip->sbu_reg_enabled) {
+		if (dp) {
+			regulator_set_voltage(chip->sbu_reg, SBU_PULLUP_UV,
+					      SBU_PULLUP_UV);
+			ret = regulator_enable(chip->sbu_reg);
+		} else {
+			ret = regulator_disable(chip->sbu_reg);
+		}
+
+		if (ret < 0)
+			dev_err(chip->dev, "Failed to %s the SBU pull-up: %d\n",
+				dp ? "enable" : "disable", ret);
+		else
+			chip->sbu_reg_enabled = dp;
+	}
+
+	ret = max_tcpci_write8(chip, TCPC_VENDOR_SBUSW_CTRL,
+			       dp ? SBUSW_PATH_1 : SBUSW_OFF);
+	if (ret < 0)
+		dev_err(chip->dev, "Failed to %s the SBU switch: %d\n",
+			dp ? "close" : "open", ret);
+
+	return ret;
+}
+
+static int max_tcpci_mux_set(struct typec_mux_dev *mux,
+			     struct typec_mux_state *state)
+{
+	struct max_tcpci_chip *chip = typec_mux_get_drvdata(mux);
+	int ret;
+
+	switch (state->mode) {
+	case TYPEC_DP_STATE_A:
+	case TYPEC_DP_STATE_B:
+	case TYPEC_DP_STATE_C:
+	case TYPEC_DP_STATE_D:
+	case TYPEC_DP_STATE_E:
+	case TYPEC_DP_STATE_F:
+		/*
+		 * Every DP pin assignment needs AUX, and the ones that keep USB
+		 * alongside leave the D+/D- switches to the USB_COMM path.
+		 */
+		return max_tcpci_sbu_switch(chip, true);
+	default:
+		break;
+	}
+
+	/*
+	 * Leave the remaining alternate and accessory modes alone: they arrive
+	 * only through PD, where set_partner_usb_comm_capable() above already
+	 * owns the switches.
+	 */
+	if (state->mode != TYPEC_STATE_USB && state->mode != TYPEC_STATE_SAFE)
+		return 0;
+
+	/* Back off DP: unroute SBU and drop the rail again. */
+	max_tcpci_sbu_switch(chip, false);
+
+	ret = max_tcpci_write8(chip, TCPC_VENDOR_USBSW_CTRL,
+			       state->mode == TYPEC_STATE_USB ?
+			       TCPC_VENDOR_USBSW_CTRL_ENABLE_USB_DATA :
+			       TCPC_VENDOR_USBSW_CTRL_DISABLE_USB_DATA);
+	if (ret < 0)
+		dev_err(chip->dev, "Failed to set USB switches for mode %lu\n",
+			state->mode);
+
+	return ret;
 }
 
 static irqreturn_t _max_tcpci_irq(struct max_tcpci_chip *chip, u16 status)
@@ -576,6 +746,40 @@ static int max_tcpci_gpio_init(struct max_tcpci_chip *chip)
 	return devm_gpiochip_add_data(chip->dev, &chip->gpio, chip);
 }
 
+static void max_tcpci_unregister_mux(void *mux)
+{
+	typec_mux_unregister(mux);
+}
+
+static int max_tcpci_register_mux(struct max_tcpci_chip *chip)
+{
+	struct typec_mux_desc mux_desc;
+
+	/*
+	 * Only boards that link the connector back to this device expect the
+	 * switches to follow the connector state; leave the rest on the
+	 * USB_COMM path alone.  Register before the port, or its mode-switch
+	 * lookup defers on a mux this same probe has not created yet.
+	 */
+	if (!device_property_present(chip->dev, "mode-switch"))
+		return 0;
+
+	mux_desc = (struct typec_mux_desc){
+		.fwnode = dev_fwnode(chip->dev),
+		.set = max_tcpci_mux_set,
+		.drvdata = chip,
+		.name = dev_name(chip->dev),
+	};
+
+	chip->mux = typec_mux_register(chip->dev, &mux_desc);
+	if (IS_ERR(chip->mux))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->mux),
+				     "USB switch mode-switch registration failed\n");
+
+	return devm_add_action_or_reset(chip->dev, max_tcpci_unregister_mux,
+					chip->mux);
+}
+
 static int max_tcpci_probe(struct i2c_client *client)
 {
 	int ret;
@@ -616,6 +820,27 @@ static int max_tcpci_probe(struct i2c_client *client)
 	INIT_WORK(&chip->sourcing_vbus_work, max_tcpci_sourcing_vbus_work);
 
 	max_tcpci_init_regs(chip);
+
+	ret = max_tcpci_register_mux(chip);
+	if (ret)
+		return ret;
+
+	/*
+	 * Optional: boards that route SBU to DP AUX may gate the pair behind a
+	 * pull-up rail. Without one the switch still closes, which is all a
+	 * board with an always-on rail needs.
+	 *
+	 * A pullup-supply naming a regulator its provider never registers
+	 * defers this port forever, taking PD and charging with it -- describe
+	 * the rail only once the PMIC driver actually has a descriptor for it.
+	 */
+	chip->sbu_reg = devm_regulator_get_optional(chip->dev, "pullup");
+	if (IS_ERR(chip->sbu_reg)) {
+		if (PTR_ERR(chip->sbu_reg) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		chip->sbu_reg = NULL;
+	}
+
 	chip->tcpci = tcpci_register_port(chip->dev, &chip->data);
 	if (IS_ERR(chip->tcpci))
 		return dev_err_probe(&client->dev, PTR_ERR(chip->tcpci),

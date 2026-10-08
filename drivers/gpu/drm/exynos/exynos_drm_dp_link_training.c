@@ -6,8 +6,47 @@
  */
 
 #include <linux/err.h>
+#include <linux/phy/phy.h>
 
 #include "exynos_drm_dp.h"
+
+/*
+ * On zuma the DP link drives no PHY of its own: the lanes belong to the
+ * Synopsys USB-DP combo PHY that phy-exynos5-usbdrd owns, so the link rate,
+ * the lane count and the per-lane drive levels are handed to it through the
+ * phy framework. The dp_reg_phy_* writes alongside these calls target the
+ * Samsung DP PHY this register layer was written for, which zuma does not
+ * have; with no phy_base mapped they land nowhere.
+ *
+ * SSC is left off. Enabling it source-side means also writing
+ * DP_DOWNSPREAD_CTRL to the sink, which this driver never does.
+ */
+static void exynos_dp_phy_configure(struct exynos_dp_subdev *dp,
+				    const struct exynos_dp_lt_info *lt,
+				    bool set_rate, bool set_lanes,
+				    bool set_voltages)
+{
+	union phy_configure_opts opts = { };
+	int i, ret;
+
+	if (!dp->phy)
+		return;
+
+	opts.dp.link_rate = drm_dp_bw_code_to_link_rate(lt->link_rate) / 100;
+	opts.dp.lanes = lt->lane_cnt;
+	opts.dp.set_rate = set_rate;
+	opts.dp.set_lanes = set_lanes;
+	opts.dp.set_voltages = set_voltages;
+
+	for (i = 0; i < lt->lane_cnt && i < MAX_LANE_CNT; i++) {
+		opts.dp.voltage[i] = lt->voltage_swing[i];
+		opts.dp.pre[i] = lt->pre_emphasis[i] >> DP_TRAIN_PRE_EMPHASIS_SHIFT;
+	}
+
+	ret = phy_configure(dp->phy, &opts);
+	if (ret)
+		dp_log_err(dp->dev, "failed to configure DP phy: %d\n", ret);
+}
 
 static void exynos_dp_dump_symbol_error(struct exynos_dp_subdev *dp)
 {
@@ -23,9 +62,10 @@ static void exynos_dp_dump_symbol_error(struct exynos_dp_subdev *dp)
 			    offset, info[i], info[i + 1]);
 };
 
-static void exynos_dp_set_phy_training_lane_set(u32 id,
+static void exynos_dp_set_phy_training_lane_set(struct exynos_dp_subdev *dp,
 		u8 *dpcd_buf, struct exynos_dp_lt_info *lt_info)
 {
+	u32 id = dp->id;
 	int i;
 	u8 *drive_current = lt_info->voltage_swing;
 	u8 *pre_emphasis = lt_info->pre_emphasis;
@@ -48,6 +88,8 @@ static void exynos_dp_set_phy_training_lane_set(u32 id,
 
 		dpcd_buf[i] = drive_current[i] | pre_emphasis[i] | max_reach_value;
 	}
+
+	exynos_dp_phy_configure(dp, lt_info, false, false, true);
 }
 
 static void exynos_dp_dsc_prepare(struct exynos_dp_subdev *dp, bool enable)
@@ -110,6 +152,9 @@ static void exynos_dp_phy_init(struct exynos_dp_subdev *dp)
 
 	dp_reg_set_lane_count(id, dpcd_val[1]);
 
+	/* Retune the combo PHY's MPLLB and enable it; the lanes stay in P2. */
+	exynos_dp_phy_configure(dp, &dp->lt_info, true, false, false);
+
 	dp_log_info(dev, "link_rate = %d Mbps, lane_cnt = %x\n",
 			drm_dp_bw_code_to_link_rate(dpcd_val[0])/100, dpcd_val[1]);
 
@@ -127,9 +172,20 @@ static void exynos_dp_phy_init(struct exynos_dp_subdev *dp)
 
 	dp_reg_wait_phy_pll_lock(id);
 
-	/* SCRAMBLING_DISABLE, TRAINING_PATTERN_1 */
+	/* The PCS has to run off the PHY's TX clock, not the OSC. */
+	dp_reg_set_txclk(id, true);
+
+	/*
+	 * Only now is there a TX clock to align to, so this is where the vendor
+	 * offers it to the PHY and powers the lanes out of P2.
+	 */
+	dp_reg_set_snps_tx_clk(id, dp->lt_info.lane_cnt);
+	exynos_dp_phy_configure(dp, &dp->lt_info, false, true, false);
+	dp_reg_set_snps_tx_data_en(id, dp->lt_info.lane_cnt);
+
+	dp_log_info(dev, "GFMUX status %#x\n", dp_reg_get_gfmux_status(id));
+
 	dp_reg_set_training_pattern(id, TRAINING_PATTERN_1);
-	dp_reg_scrambling_enable(id, 0);
 
 	dpcd_val[0] = DP_LINK_SCRAMBLING_DISABLE | DP_TRAINING_PATTERN_1;
 	drm_dp_dpcd_writeb(&dp->aux, DP_TRAINING_PATTERN_SET, dpcd_val[0]);
@@ -201,7 +257,6 @@ exynos_drm_dp_lt_clock_recovery(struct exynos_dp_subdev *dp)
 {
 	struct device *dev = dp->dev;
 	struct exynos_dp_lt_info lt_info;
-	u32 id = dp->id;
 
 	u8 link_status[DP_LINK_STATUS_SIZE];
 	u8 lane_cnt = dp->lt_info.lane_cnt;
@@ -222,7 +277,7 @@ exynos_drm_dp_lt_clock_recovery(struct exynos_dp_subdev *dp)
 	for (cr_retry_no = 0;
 			cr_retry_no < LT_CR_RETRY_CNT; cr_retry_no++) {
 
-		exynos_dp_set_phy_training_lane_set(id, dpcd_buf, &lt_info);
+		exynos_dp_set_phy_training_lane_set(dp, dpcd_buf, &lt_info);
 
 		dp_log_dbg(dev, "(CR) Try TRAINING_LANEx_SET: %02x %02x %02x %02x\n",
 				dpcd_buf[0], dpcd_buf[1], dpcd_buf[2], dpcd_buf[3]);
@@ -291,12 +346,9 @@ exynos_drm_dp_lt_training_pattern(struct exynos_dp_subdev *dp)
 
 	if (drm_dp_tps4_supported(dp->dpcd) && link_rate == DP_LINK_BW_8_1) {
 		dp_reg_set_training_pattern(id, TRAINING_PATTERN_4);
-		dp_reg_scrambling_enable(id, 1);
 		dp_log_dbg(dev, "TPS4_supported\n");
 		return DP_TRAINING_PATTERN_4;
 	}
-
-	dp_reg_scrambling_enable(id, 0);
 
 	if (drm_dp_tps3_supported(dp->dpcd) && link_rate >= DP_LINK_BW_5_4) {
 		dp_reg_set_training_pattern(id, TRAINING_PATTERN_3);
@@ -315,7 +367,6 @@ exynos_drm_dp_lt_equalization(struct exynos_dp_subdev *dp)
 {
 	struct device *dev = dp->dev;
 	struct exynos_dp_lt_info *lt_info = &dp->lt_info;
-	u32 id = dp->id;
 
 	u8 link_status[DP_LINK_STATUS_SIZE];
 	u8 lane_cnt = dp->lt_info.lane_cnt;
@@ -338,7 +389,7 @@ exynos_drm_dp_lt_equalization(struct exynos_dp_subdev *dp)
 
 	for (eq_retry_no = 0; eq_retry_no < EQ_RETRY_CNT; eq_retry_no++) {
 
-		exynos_dp_set_phy_training_lane_set(id, dpcd_buf, lt_info);
+		exynos_dp_set_phy_training_lane_set(dp, dpcd_buf, lt_info);
 
 		dp_log_dbg(dev, "(EQ) Try TRAINING_LANEx_SET: %02x %02x %02x %02x\n",
 				dpcd_buf[0], dpcd_buf[1], dpcd_buf[2], dpcd_buf[3]);
@@ -359,6 +410,10 @@ exynos_drm_dp_lt_equalization(struct exynos_dp_subdev *dp)
 
 		if (cr_done && eq_done)
 			goto LT_EQ_DONE;
+
+		dp_log_info(dev, "(EQ) LINK_STATUS: %02x %02x %02x %02x %02x %02x\n",
+			    link_status[0], link_status[1], link_status[2],
+			    link_status[3], link_status[4], link_status[5]);
 
 		exynos_dp_dump_symbol_error(dp);
 
@@ -463,6 +518,8 @@ static int exynos_dp_full_link_training(struct exynos_dp_subdev *dp)
 LINK_TRAINING_END:
 	lt_done = cr_done && eq_done && !debug_lt;
 	dp_log_info(dev, "%s Full Link Training -\n", lt_done ? "Finished" : "Failed");
+	/* Stop sending a training pattern before the sink stops expecting one. */
+	dp_reg_set_training_pattern(dp->id, NORAMAL_DATA);
 	drm_dp_dpcd_writeb(&dp->aux, DP_TRAINING_PATTERN_SET, 0);
 
 	return lt_done ? 0 : -EINVAL;

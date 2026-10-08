@@ -5,6 +5,7 @@
 #include <linux/platform_device.h>
 #include <linux/component.h>
 #include <linux/irq.h>
+#include <linux/pm_runtime.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_fourcc.h>
@@ -38,11 +39,14 @@ static const struct of_device_id dpp_of_match[] = {
 	{},
 };
 
-void dpp_update(struct exynos_dpp_context *dpp, unsigned int channel,
+void dpp_update(struct exynos_dpp_context *dpp,
 		const struct exynos_drm_plane_state *state)
 {
 	const struct drm_framebuffer *fb = state->base.fb;
 	u32 fmt;
+
+	if (pm_runtime_resume_and_get(dpp->dev) < 0)
+		return;
 
 	/*
 	 * DPP block: the pixel format lives in DPP_COM_IO_CON and the image size
@@ -64,18 +68,16 @@ void dpp_update(struct exynos_dpp_context *dpp, unsigned int channel,
 		break;
 	}
 
-	writel(DPP_IMG_FORMAT(fmt), dpp->regs + 0x1000 + DPP_COM_IO_CON);
+	writel(DPP_IMG_FORMAT(fmt), dpp->regs + DPP_COM_IO_CON);
 	writel(DPP_IMG_HEIGHT(state->src.h) | DPP_IMG_WIDTH(state->src.w),
-	       dpp->regs + 0x1000 + DPP_COM_IMG_SIZE);
+	       dpp->regs + DPP_COM_IMG_SIZE);
+
+	pm_runtime_put_sync(dpp->dev);
 }
 
+/* Nothing to do: each DECON picks its own DPP out of DT. */
 static int dpp_bind(struct device *dev, struct device *master, void *data)
 {
-	struct drm_device *drm_dev = data;
-	struct exynos_drm_private *devpriv = drm_dev->dev_private;
-
-	devpriv->dpp_dev = dev;
-
 	return 0;
 }
 
@@ -96,14 +98,14 @@ static int dpp_probe(struct platform_device *pdev)
 	dpp->dev = dev;
 
 	/*
-	 * Physical DPU channel this DPP/IDMA drives. The DECON maps each window
-	 * to a channel via WIN_CHMAP (config->dpp_type), and the DPU-DMA feeds
-	 * that same channel: dpu_dma_update() uses logical channel 0, which
-	 * channel_map[0] resolves to physical IDMA 5 (the GF0 block at
-	 * 0x19905000, dpp,id = 5). WIN_CHMAP must therefore be 5, or the DECON
-	 * blender reads an unfed channel and stalls mid-frame waiting for pixels.
+	 * Physical DPU channel this DPP/IDMA drives, and the one number the
+	 * whole fetch path is indexed by: the DECON's WIN_CHMAP, the DPP block
+	 * (0x19930000 + ch * 0x1000) and the IDMA block (0x19900000 + ch *
+	 * 0x1000). GF0 is 5, GF1 is 6. Get it wrong and the DECON blender reads
+	 * an unfed channel and stalls mid-frame waiting for pixels.
 	 */
-	dpp->type = 5;
+	if (of_property_read_u32(dev->of_node, "dpp,id", &dpp->type))
+		dpp->type = 5;
 
 	dpp->aclk = devm_clk_get_enabled(dpp->dev, "aclk");
 	if (IS_ERR(dpp->aclk))
@@ -116,6 +118,9 @@ static int dpp_probe(struct platform_device *pdev)
 	dpp->regs = devm_ioremap_resource(dev, res);
 
 	platform_set_drvdata(pdev, dpp);
+
+	/* Taken around the register writes in dpp_update(). */
+	pm_runtime_enable(dev);
 
 	return component_add(dev, &dpp_component_ops);
 }

@@ -3,15 +3,16 @@
  * AoC USF sensor framework -> IIO bridge.
  *
  * Bridges the sensors hosted by the AoC USF (Unified Sensor Framework)
- * firmware to Linux IIO. The AoC sensor registry is loaded out of band by a
- * userspace daemon; once it is loaded this driver enumerates the sensors over
- * the com.google.usf AOCC channel and exposes them as IIO devices. This is the
- * data-plane half described in docs/subsystems/sensors/reference/usf-iio-bridge.md.
+ * firmware to Linux IIO. Once the AoC sensor registry is loaded this driver
+ * enumerates the sensors over the com.google.usf AOCC channel and exposes them
+ * as IIO devices. This is the data-plane half described in
+ * docs/subsystems/sensors/reference/usf-iio-bridge.md.
  *
- * The registry-load daemon "pokes" this driver once the registry is ready by
- * writing the "enumerate" sysfs attribute; the driver stays inert until then.
- * The autopoll module parameter is a kernel-only bring-up escape hatch that
- * enumerates at probe instead.
+ * The registry comes from the firmware search path, fetched by the enumeration
+ * work below, which retries for long enough to outlast the switch to the real
+ * root - so nothing in userspace has to sequence it, and enumeration starts at
+ * probe. The "enumerate" sysfs attribute retriggers it, and autopoll=0 holds it
+ * back for a platform whose userspace would rather own the timing.
  */
 
 #define pr_fmt(fmt) "usf-iio: " fmt
@@ -62,10 +63,10 @@
  */
 #define USF_IIO_MODE		USF_MODE_FUSED
 
-static bool autopoll;
+static bool autopoll = true;
 module_param(autopoll, bool, 0644);
 MODULE_PARM_DESC(autopoll,
-		 "enumerate sensors at probe instead of waiting for the sysfs poke");
+		 "enumerate sensors at probe (default); clear to wait for the sysfs poke instead");
 
 static char *sensor = "";
 module_param(sensor, charp, 0644);
@@ -123,6 +124,54 @@ struct usf_sensor {
 	 */
 	u64 res_q;
 	u64 scale_nano;		/* IIO_CHAN_INFO_SCALE in nano units */
+
+	/*
+	 * Most recent sample, for IIO_CHAN_INFO_RAW. The AoC pushes on change
+	 * rather than at samp_freq -- the ALS can go seconds between samples --
+	 * so a one-shot read has nothing to wait for. Cache what the stream
+	 * last gave us instead. Written under sample_lock.
+	 */
+	s32 last[3];
+	bool have_last;
+	bool dcount_logged;	/* one-shot report of the firmware's value count */
+};
+
+/*
+ * How the sensor frame sits in the device frame.
+ *
+ * The AoC reports every sensor in the Android device frame, and that frame sits
+ * half a turn about Z from the one Linux orientation consumers assume, so
+ * samples taken at face value put every rotation upside down - portrait and
+ * landscape alike, both ways round.
+ *
+ * This is a property of the AoC's reporting convention, not of where any one
+ * board puts its IMU: the AoC has already corrected for that by the time a
+ * sample reaches the AP, and it reports the same frame on every device that
+ * runs it. So it belongs here rather than in a per-board DT mount-matrix.
+ */
+static const struct iio_mount_matrix usf_mount_matrix = {
+	.rotation = {
+		"-1", "0", "0",
+		"0", "-1", "0",
+		"0", "0", "1",
+	},
+};
+
+static const struct iio_mount_matrix *
+usf_get_mount_matrix(const struct iio_dev *indio_dev,
+		     const struct iio_chan_spec *chan)
+{
+	return &usf_mount_matrix;
+}
+
+/*
+ * IIO_SHARED_BY_TYPE names the attribute in_<type>_mount_matrix, which is
+ * where userspace looks for it. Only the three-axis sensors have a frame to
+ * describe, so the scalar channels do not carry it.
+ */
+static const struct iio_chan_spec_ext_info usf_ext_info[] = {
+	IIO_MOUNT_MATRIX(IIO_SHARED_BY_TYPE, usf_get_mount_matrix),
+	{ }
 };
 
 /* Fixed-point fraction bits for the resolution divisor (res_q). */
@@ -132,6 +181,7 @@ struct usf_sensor {
 /* Forced scan masks (all data channels; timestamp is tracked separately). */
 static const unsigned long usf_scan_masks_3axis[] = { GENMASK(2, 0), 0 };
 static const unsigned long usf_scan_masks_scalar[] = { BIT(0), 0 };
+static const unsigned long usf_scan_masks_2axis[] = { GENMASK(1, 0), 0 };
 
 /*
  * Sample axes arrive as f32 in Android sensor units. The data path quantises
@@ -145,6 +195,7 @@ static const unsigned long usf_scan_masks_scalar[] = { BIT(0), 0 };
 	.channel2 = IIO_MOD_##_mod,				\
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
 	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
+	.ext_info = usf_ext_info,				\
 	.scan_index = _idx,					\
 	.scan_type = {						\
 		.sign = 's',					\
@@ -171,6 +222,7 @@ static const struct iio_chan_spec usf_magn_channels[] = {
 
 #define USF_SCALAR_CHANNEL(_type) {				\
 	.type = _type,						\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),		\
 	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
 	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
 	.scan_index = 0,					\
@@ -194,6 +246,33 @@ static const struct iio_chan_spec usf_prox_channels[] = {
 static const struct iio_chan_spec usf_pressure_channels[] = {
 	USF_SCALAR_CHANNELS(IIO_PRESSURE),
 };
+/*
+ * A thermopile measures two things: the temperature of whatever it is pointed
+ * at, and its own, which the object reading is derived against. IIO has
+ * modifiers for exactly this pair, and the in-tree mlx90632 driver declares the
+ * same two channels.
+ */
+#define USF_TEMP_CHANNEL(_mod, _idx) {				\
+	.type = IIO_TEMP,					\
+	.modified = 1,						\
+	.channel2 = IIO_MOD_TEMP_##_mod,			\
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),		\
+	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE),	\
+	.info_mask_shared_by_all = BIT(IIO_CHAN_INFO_SAMP_FREQ),	\
+	.scan_index = _idx,					\
+	.scan_type = {						\
+		.sign = 's',					\
+		.realbits = 32,					\
+		.storagebits = 32,				\
+		.endianness = IIO_LE,				\
+	},							\
+}
+
+static const struct iio_chan_spec usf_temp_channels[] = {
+	USF_TEMP_CHANNEL(AMBIENT, 0),
+	USF_TEMP_CHANNEL(OBJECT, 1),
+	IIO_CHAN_SOFT_TIMESTAMP(2),
+};
 
 /* Map a USF sensor name (substring) to an IIO device type + channels. */
 static const struct usf_type_map {
@@ -206,7 +285,8 @@ static const struct usf_type_map {
 	/*
 	 * Android-native -> IIO unit factor, times 1e9: SCALE(nano) =
 	 * resolution * unit_nano. 1e9 = 1:1 (accel m/s^2, gyro rad/s, light
-	 * lux, prox count); mag uT -> Gauss is /100; pressure hPa -> kPa is /10.
+	 * lux, prox count); mag uT -> Gauss is /100; pressure hPa -> kPa is /10;
+	 * temperature degC -> milli-degC is *1000, so 1e12.
 	 */
 	u64 unit_nano;
 } usf_type_maps[] = {
@@ -223,7 +303,27 @@ static const struct usf_type_map {
 	  ARRAY_SIZE(usf_prox_channels), 1, usf_scan_masks_scalar, 1000000000ULL },
 	{ "Barometer", "usf_baro", usf_pressure_channels,
 	  ARRAY_SIZE(usf_pressure_channels), 1, usf_scan_masks_scalar, 100000000ULL },
+	/* the same sensor, named after the part rather than the function */
+	{ "Pressure Sensor", "usf_baro", usf_pressure_channels,
+	  ARRAY_SIZE(usf_pressure_channels), 1, usf_scan_masks_scalar, 100000000ULL },
+	/*
+	 * The infrared thermometer in the camera bar: a Melexis MLX90632
+	 * far-infrared thermopile, which reads the temperature of whatever the
+	 * phone is pointed at rather than its own package. The AoC offers it as
+	 * two sensors over the one part, a default range and an extended one.
+	 *
+	 * Matched on the full names, because "Temperature" alone also matches
+	 * the IMU's and the barometer's own die sensors, which measure
+	 * something entirely different. Neither of these two names is a
+	 * substring of the other, so they cannot shadow each other either.
+	 */
+	{ "MLX90632 FIR Extended Temperature", "usf_irtemp_ext", usf_temp_channels,
+	  ARRAY_SIZE(usf_temp_channels), 2, usf_scan_masks_2axis, 1000000000000ULL },
+	{ "MLX90632 FIR Temperature", "usf_irtemp", usf_temp_channels,
+	  ARRAY_SIZE(usf_temp_channels), 2, usf_scan_masks_2axis, 1000000000000ULL },
 };
+
+static int usf_start_sampling(struct usf_sensor *s);
 
 static int usf_read_raw(struct iio_dev *indio_dev,
 			struct iio_chan_spec const *chan,
@@ -232,6 +332,31 @@ static int usf_read_raw(struct iio_dev *indio_dev,
 	struct usf_sensor *s = iio_priv(indio_dev);
 
 	switch (mask) {
+	case IIO_CHAN_INFO_RAW: {
+		int idx = chan->scan_index;
+		int ret;
+
+		if (idx < 0 || idx >= ARRAY_SIZE(s->last))
+			return -EINVAL;
+
+		/*
+		 * Nothing streams until someone asks. Start on the first read
+		 * and leave it running: these are on-change sensors, so the
+		 * traffic is negligible and stopping between polls would mean
+		 * never having a value to return.
+		 */
+		if (!READ_ONCE(s->sampling_id)) {
+			ret = usf_start_sampling(s);
+			if (ret)
+				return ret;
+		}
+
+		if (!READ_ONCE(s->have_last))
+			return -EAGAIN;
+
+		*val = READ_ONCE(s->last[idx]);
+		return IIO_VAL_INT;
+	}
 	case IIO_CHAN_INFO_SCALE:
 		/* SCALE = resolution * unit factor, discovered per sensor. */
 		*val = s->scale_nano / USF_NANO;
@@ -452,6 +577,11 @@ static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 	}
 	indio = match->indio;
 	n = min_t(int, match->ndata, dcount);
+	if (!match->dcount_logged) {
+		match->dcount_logged = true;
+		dev_info(usf->dev, "%s: firmware sends %u value(s) per sample, %d mapped\n",
+			 indio->name, dcount, match->ndata);
+	}
 
 	for (i = 0; i < scount; i++) {
 		u64 tsp;
@@ -467,6 +597,9 @@ static void usf_handle_sample(struct usf_iio *usf, const u8 *pay, u32 plen)
 		for (d = 0; d < (u32)n; d++)
 			scan.chan[d] = usf_scale_sample(match,
 				get_unaligned_le32(pay + off + 8 + d * 4));
+
+		memcpy(match->last, scan.chan, sizeof(match->last));
+		match->have_last = true;
 
 		iio_push_to_buffers_with_ts(indio, &scan, sizeof(scan), ts);
 	}

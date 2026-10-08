@@ -128,6 +128,7 @@ static int max77779_otg_enable(struct regulator_dev *rdev)
 static int max77779_otg_disable(struct regulator_dev *rdev)
 {
 	struct max77779_charger *chg = rdev_get_drvdata(rdev);
+	int ret;
 
 	guard(mutex)(&chg->lock);
 
@@ -135,7 +136,14 @@ static int max77779_otg_disable(struct regulator_dev *rdev)
 		gpiod_set_value_cansleep(chg->ext_bst_ctl, 0);
 
 	chg->otg_enabled = false;
-	return __max77779_set_mode(chg, MAX77779_CHGR_MODE_OFF);
+	/* The external boost is off even if the charger mode write fails. */
+	ret = __max77779_set_mode(chg, MAX77779_CHGR_MODE_OFF);
+	if (ret && chg->ext_bst_ctl) {
+		dev_warn(chg->dev, "OTG off: charger off failed: %d\n", ret);
+		return 0;
+	}
+
+	return ret;
 }
 
 static int max77779_otg_is_enabled(struct regulator_dev *rdev)
@@ -224,7 +232,9 @@ static int max77779_set_input_limit(struct max77779_charger *chg, int ua)
 					 &selector);
 
 	return regmap_update_bits(chg->regmap, MAX77779_CHGR_REG_CHG_CNFG_09,
+				  MAX77779_CHGR_REG_CHG_CNFG_09_NO_AUTOIBUS |
 				  MAX77779_CHGR_REG_CHG_CNFG_09_CHGIN_ILIM,
+				  MAX77779_CHGR_REG_CHG_CNFG_09_NO_AUTOIBUS |
 				  selector);
 }
 
@@ -620,6 +630,14 @@ static int max77779_charger_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "failed to stop charger\n");
+
+	/* Protected charger configuration writes need CHGPROT unlocked. */
+	ret = regmap_update_bits(chg->regmap, MAX77779_CHGR_REG_CHG_CNFG_06,
+				 MAX77779_CHGR_REG_CHG_CNFG_06_CHGPROT,
+				 MAX77779_CHGR_REG_CHG_CNFG_06_CHGPROT);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret,
+				     "failed to unlock charger configuration\n");
 
 	ret = max77779_set_charge_current(chg,
 					  MAX77779_SAFE_CHARGE_CURRENT_UA);

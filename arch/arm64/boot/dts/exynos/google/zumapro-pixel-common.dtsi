@@ -31,6 +31,7 @@
 			compatible = "simple-framebuffer";
 			memory-region = <&cont_splash_mem>;
 			/* format properties to be added by actual board */
+
 			status = "disabled";
 		};
 	};
@@ -58,7 +59,7 @@
 		status = "disabled";
 	};
 
-	gpio-keys {
+	gpio_keys: gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-0 = <&key_voldown>, <&key_volup>, <&key_power>;
 		pinctrl-names = "default";
@@ -112,6 +113,13 @@
 		regulator-name = "ufs-vcc";
 		gpio = <&gpp0 1 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
+		/*
+		 * Nothing claims this -- ufs-exynos never asks for a vcc
+		 * supply -- so the disable-unused sweep will pull GPP0_1 low
+		 * and cut power to the rootfs.  boot-on does not stop it;
+		 * only always-on does.
+		 */
+		regulator-always-on;
 		enable-active-high;
 	};
 
@@ -120,6 +128,7 @@
 			/* size to be updated by actual board */
 			reg = <0x0 0xfac00000 0x0>;
 			no-map;
+
 			status = "disabled";
 		};
 	};
@@ -157,7 +166,6 @@
 				regulator-min-microvolt = <450000>;
 				regulator-max-microvolt = <1300000>;
 				regulator-ramp-delay = <6250>;
-				regulator-always-on;
 			};
 
 			m_ldo5_reg: ldo5m {
@@ -207,6 +215,30 @@
 		wakeup-source;
 
 		regulators {
+			s_buck1_reg: buck1s {
+				/*
+				 * Named for the camera, but the display needs
+				 * it: letting the disable-unused sweep take it
+				 * SErrors the next DECON register write in
+				 * zuma_decon_enable_window().  No DPU node
+				 * declares a supply, so nothing holds it up on
+				 * its own.
+				 */
+				regulator-name = "vdd_cam";
+				regulator-min-microvolt = <450000>;
+				regulator-max-microvolt = <1300000>;
+				regulator-ramp-delay = <6250>;
+				regulator-always-on;
+			};
+
+			s_buck12_reg: buck12s {
+				/* Aurora DSP. No consumer in mainline. */
+				regulator-name = "vdd_aur";
+				regulator-min-microvolt = <450000>;
+				regulator-max-microvolt = <1300000>;
+				regulator-ramp-delay = <6250>;
+			};
+
 			s_buck2_reg: buck2s {
 				/* GPU */
 				regulator-name = "vdd_g3d";
@@ -240,7 +272,7 @@
 				/* UFS/MIPI PLL rail on zumapro */
 				regulator-name = "vdd_ufs_pll";
 				regulator-min-microvolt = <700000>;
-				regulator-max-microvolt = <1300000>;
+				regulator-max-microvolt = <1087500>;
 				regulator-always-on;
 			};
 
@@ -292,10 +324,12 @@
 			 */
 			s_ldo5_reg: ldo5s {
 				regulator-name = "L5S_PROX";
+				regulator-always-on;
 			};
 
 			s_ldo7_reg: ldo7s {
 				regulator-name = "L7S_SENSORS";
+				regulator-always-on;
 			};
 		};
 
@@ -407,8 +441,20 @@
 		gpio-controller;
 		#gpio-cells = <2>;
 
+		/*
+		 * The SBU switch that routes DP AUX to the connector lives in
+		 * this TCPC, so the connector links its mode switch back here.
+		 */
+		mode-switch;
+
 		/* VBUS sourcing (host mode) via the max77779 external boost */
 		vbus-supply = <&max77779_otg>;
+
+		port {
+			usbc0_sbu_sw_in: endpoint {
+				remote-endpoint = <&usbc0_sbu_sw>;
+			};
+		};
 
 		connector {
 			compatible = "usb-c-connector";
@@ -456,30 +502,77 @@
 						0, 0, 0x18d1)
 					VDO_CERT(0x0)
 					VDO_PRODUCT(0x4ee1, 0x0)>;
-			/*
-			 * Until bootloader is updated to set those two when
-			 * console is enabled, we disable PD here.
-			 */
-			pd-disable;
 			typec-power-opmode = "default";
+
+			/*
+			 * Where the DP alt mode driver sends hotplug: it
+			 * resolves this reference and raises an out-of-band
+			 * event on the DRM connector whose fwnode matches,
+			 * which drm_bridge_connector turns into an HPD notify.
+			 * Undocumented in usb-connector.yaml, but it is what
+			 * dp_altmode_probe() looks for.
+			 */
+			displayport = <&dp>;
+
+			/*
+			 * dp_altmode_probe() intersects this against the
+			 * partner's pin assignments and refuses the mode if
+			 * nothing overlaps, so the port has to name its own:
+			 * DFP_D, HBR3, receptacle, assignments C (four DP
+			 * lanes) and D (two, USB3 alongside) -- the two the
+			 * combo PHY's TCA mux can route.
+			 */
+			altmodes {
+				displayport {
+					svid = /bits/ 16 <0xff01>;
+					vdo = <0x00000c46>;
+				};
+			};
 
 			ports {
 				#address-cells = <1>;
 				#size-cells = <0>;
 
+				/*
+				 * High speed: the DWC3 data role, and the
+				 * TCPC's own switches.
+				 */
 				port@0 {
 					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					usbc0_role_sw: endpoint@0 {
+						reg = <0>;
+						remote-endpoint = <&usbdrd31_dwc3_role_switch>;
+					};
+
+					usbc0_sbu_sw: endpoint@1 {
+						reg = <1>;
+						remote-endpoint = <&usbc0_sbu_sw_in>;
+					};
+				};
+
+				/* Super speed: the USB31DRD combo PHY, which */
+				/* takes the connector orientation.           */
+				port@1 {
+					reg = <1>;
 
 					usbc0_orien_sw: endpoint {
 						remote-endpoint = <&usbdrd31_phy_orien_switch>;
 					};
 				};
 
-				port@1 {
-					reg = <1>;
+				/*
+				 * SBU: no AUX switch is described here yet, so
+				 * this port carries only the alternate mode
+				 * lane routing, which the combo PHY's TCA does.
+				 */
+				port@2 {
+					reg = <2>;
 
-					usbc0_role_sw: endpoint {
-						remote-endpoint = <&usbdrd31_dwc3_role_switch>;
+					usbc0_mode_sw: endpoint {
+						remote-endpoint = <&usbdrd31_phy_mode_switch>;
 					};
 				};
 			};
@@ -494,7 +587,7 @@
 		pinctrl-names = "default";
 		interrupts-extended = <&gpa7 7 IRQ_TYPE_LEVEL_LOW>;
 
-		shunt-resistor-micro-ohms = <10000>;
+		shunt-resistor-micro-ohms = <2000>;
 	};
 
 	pmic@66 {
@@ -516,6 +609,14 @@
 			regulator-name = "vbus";
 			regulator-min-microvolt = <5000000>;
 			regulator-max-microvolt = <5000000>;
+			/*
+			 * Enabling is one write to the boost's enable; it then
+			 * soft-starts on its own and nothing reports when the
+			 * rail is live, so hold consumers off for as long as
+			 * that takes. The vendor driver open-codes the same
+			 * wait as two 5ms sleeps around the assert.
+			 */
+			regulator-enable-ramp-delay = <10000>;
 		};
 
 		gpio {
@@ -631,21 +732,6 @@
 		samsung,pin-pud = <GS101_PIN_PULL_NONE>;
 		samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
 	};
-	// aoc2ap_irq: aoc2ap-irq {
-	// 	samsung,pins = "gpa8-6";
-	// 	samsung,pin-function = <GS101_PIN_FUNC_EINT>;
-	// 	samsung,pin-pud = <GS101_PIN_PULL_DOWN>;
-	// 	samsung,pin-drv = <GS101_PIN_DRV_2_5_MA>;
-	// };
-};
-
-&pinctrl_peric1 {
-	// ap2aoc: ap2aoc {
-	// 	samsung,pins = "gpp26-1";
-	// 	samsung,pin-pud = <GS101_PIN_PULL_NONE>;
-	// 	samsung,pin-con-pdn = <GS101_PIN_PDN_PREV>;
-	// 	samsung,pin-pud-pdn = <GS101_PIN_PULL_NONE>;
-	// };
 };
 
 &serial_0 {
@@ -669,8 +755,32 @@
 	sram-supply = <&s_ldo1_reg>;
 };
 
-&ufs_0 {
+/*
+ * Hardware video encode and decode, with its own CMU and that CMU's SYSREG.
+ * The power domain and the SysMMU need no enabling - they carry no status and
+ * are live already.
+ */
+&mfc {
 	status = "okay";
+};
+
+&cmu_mfc {
+	status = "okay";
+};
+
+&sysreg_mfc {
+	status = "okay";
+};
+
+/*
+ * The NoC QoS ports the codec votes memory bandwidth through.  Not codec
+ * specific - any master that needs a bandwidth floor goes through here.
+ */
+&bts {
+	status = "okay";
+};
+
+&ufs_0 {
 	vcc-supply = <&ufs_0_fixed_vcc_reg>;
 	vdd-hba-supply = <&s_ldo2_reg>;
 	vccq-supply = <&s_ldo2_reg>;
@@ -678,6 +788,8 @@
 	vcc-max-microamp = <0>;
 	vccq-max-microamp = <0>;
 	vccq2-max-microamp = <0>;
+
+	status = "okay";
 };
 
 &ufs_0_phy {
@@ -687,6 +799,7 @@
 &usbdrd31 {
 	vdd10-supply = <&reg_placeholder>;
 	vdd33-supply = <&reg_placeholder>;
+
 	status = "okay";
 };
 
@@ -695,6 +808,7 @@
 	usb-role-switch;
 	role-switch-default-mode = "peripheral";
 	maximum-speed = "super-speed-plus";
+
 	status = "okay";
 
 	port {
@@ -706,6 +820,7 @@
 
 &usbdrd31_phy {
 	orientation-switch;
+	mode-switch;
 	/* TODO: Update these once PMIC is implemented */
 	pll-supply = <&reg_placeholder>;
 	dvdd-usb20-supply = <&reg_placeholder>;
@@ -713,17 +828,28 @@
 	vdd33-usb20-supply = <&reg_placeholder>;
 	vdda-usbdp-supply = <&reg_placeholder>;
 	vddh-usbdp-supply = <&reg_placeholder>;
+
 	status = "okay";
 
 	port {
-		usbdrd31_phy_orien_switch: endpoint {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		usbdrd31_phy_orien_switch: endpoint@0 {
+			reg = <0>;
 			remote-endpoint = <&usbc0_orien_sw>;
+		};
+
+		usbdrd31_phy_mode_switch: endpoint@1 {
+			reg = <1>;
+			remote-endpoint = <&usbc0_mode_sw>;
 		};
 	};
 };
 
 &usi_uart {
 	samsung,clkreq-on; /* needed for UART mode */
+
 	status = "okay";
 };
 
@@ -776,23 +902,13 @@
 
 &usi10 {
 	samsung,mode = <USI_MODE_I2C>;
+
 	status = "okay";
-};
-
-&usi11 {
-	status = "disabled";
-};
-
-&usi12 {
-	status = "disabled";
-};
-
-&usi13 {
-	status = "disabled";
 };
 
 &usi15 {
 	samsung,mode = <USI_MODE_SPI>;
+
 	status = "okay";
 };
 
@@ -802,40 +918,37 @@
 
 &usi18 {
 	samsung,clkreq-on; /* needed for UART mode */
-	status = "okay";
-};
 
-&usi19 {
-	status = "disabled";
+	status = "okay";
 };
 
 &usi20 {
 	samsung,mode = <USI_MODE_SPI>;
+
 	status = "okay";
 };
 
 &usi21 {
 	samsung,mode = <USI_MODE_SPI>;
+
 	status = "okay";
 };
 
 &usi22 {
 	samsung,mode = <USI_MODE_SPI>;
+
 	status = "okay";
 };
 
 &usi23 {
 	samsung,mode = <USI_MODE_SPI>;
+
 	status = "okay";
 };
 
 &usi24 {
 	samsung,mode = <USI_MODE_SPI>;
-	status = "okay";
-};
 
-&watchdog_cl0 {
-	timeout-sec = <30>;
 	status = "okay";
 };
 
@@ -851,18 +964,9 @@
 	status = "okay";
 };
 
-&spi_21 {
-	status = "okay";
-};
-
-&spi_22 {
-	status = "okay";
-};
-
 &spi_20 {
-	#address-cells = <1>;
-	#size-cells = <0>;
 	status = "okay";
+
 	/*
 	 * Bus on gpp4-0/1/2 with native chip-select on gpp4-3 (spi2_cs_func,
 	 * FUNC_3). No cs-gpios: TouchComm needs the native manual chip-select
@@ -904,4 +1008,17 @@
 			cs-clock-delay = <2>;
 		};
 	};
+};
+
+&spi_21 {
+	status = "okay";
+};
+
+&spi_22 {
+	status = "okay";
+};
+
+&watchdog_cl0 {
+	timeout-sec = <30>;
+	status = "okay";
 };

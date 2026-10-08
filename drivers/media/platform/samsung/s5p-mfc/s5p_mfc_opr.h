@@ -14,6 +14,12 @@
 
 #include "s5p_mfc_common.h"
 
+static inline bool s5p_mfc_dma_addr_valid(struct s5p_mfc_dev *dev,
+					dma_addr_t addr)
+{
+	return !IS_MFCV16_PLUS(dev) || addr >= dev->fw_buf.dma + dev->fw_buf.size;
+}
+
 struct s5p_mfc_regs {
 
 	/* codec common registers */
@@ -289,7 +295,9 @@ struct s5p_mfc_hw_ops {
 	int (*alloc_dev_context_buffer)(struct s5p_mfc_dev *dev);
 	void (*release_dev_context_buffer)(struct s5p_mfc_dev *dev);
 	void (*dec_calc_dpb_size)(struct s5p_mfc_ctx *ctx);
-	void (*enc_calc_src_size)(struct s5p_mfc_ctx *ctx);
+	void (*enc_calc_src_size)(struct s5p_mfc_dev *dev,
+			const struct s5p_mfc_fmt *fmt, unsigned int width,
+			unsigned int height, struct s5p_mfc_raw_layout *l);
 	int (*set_enc_stream_buffer)(struct s5p_mfc_ctx *ctx,
 			unsigned long addr, unsigned int size);
 	void (*set_enc_frame_buffer)(struct s5p_mfc_ctx *ctx,

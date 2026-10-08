@@ -1,0 +1,50 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* Register definitions for the MFC v16 firmware interface. */
+
+#ifndef _REGS_MFC_V16_H
+#define _REGS_MFC_V16_H
+
+#include "regs-mfc-v12.h"
+
+#define S5P_FIMV_RISC_NONSECURE_BASE_V16		0x0068
+#define S5P_FIMV_BUS_STATUS_V16			0x7018
+#define S5P_FIMV_MFC_VERSION_V16			0xf028
+#define S5P_FIMV_FIRMWARE_STATUS_V16		0xf0a4
+#define S5P_FIMV_D_AVAILABLE_DPB_FLAG_UPPER_V16	0xf5b8
+#define S5P_FIMV_D_DYNAMIC_DPB_FLAG_UPPER_V16	0xf5d4
+#define S5P_FIMV_D_DYNAMIC_DPB_FLAG_LOWER_V16	0xf5d8
+#define S5P_FIMV_D_USED_DPB_FLAG_LOWER_V16		0xf724
+#define S5P_FIMV_D_OPT_DYNAMIC_DPB_V16		BIT(3)
+#define S5P_FIMV_D_OPT_COPY_NOT_CODED_V16		BIT(4)
+#define S5P_FIMV_D_OPT_VP9_STRIDE_V16		(2 << 7)
+#define S5P_FIMV_D_STATUS_INTER_RES_CHANGE_V16	GENMASK(10, 9)
+#define S5P_FIMV_D_DECODED_STATUS_V16		0xf644
+#define S5P_FIMV_D_NUM_TILES_MASK_V16		GENMASK(18, 15)
+#define S5P_FIMV_D_H264_INFO_V16			0xf690
+#define S5P_FIMV_D_MBAFF_V16			BIT(9)
+#define S5P_FIMV_D_DECODED_PICTURE_PROFILE_V16	0xf660
+#define S5P_FIMV_D_BIT_DEPTH_MINUS8_MASK_V16	GENMASK(21, 16)
+#define S5P_FIMV_D_CHROMA_FORMAT_V16		0xf684
+#define S5P_FIMV_D_CHROMA_FORMAT_MASK_V16		GENMASK(1, 0)
+#define S5P_FIMV_D_CHROMA_420_V16			1
+
+#define MFC_VERSION_V16				0x160
+#define MFC_VERSION_ZUMAPRO			0x16060000
+
+#define S5P_FIMV_ENC_PROFILE_H264_BASELINE_V16	0
+#define S5P_FIMV_ENC_PROFILE_H264_MAIN_V16		1
+#define S5P_FIMV_ENC_PROFILE_H264_HIGH_V16		2
+#define S5P_FIMV_E_VPX_IVF_HEADER_DISABLE_V16	BIT(12)
+#define S5P_FIMV_E_VP9_OPTIONS_V16		0xfd90
+#define S5P_FIMV_E_VP9_GOLDEN_FRAME_OPTION_V16	0xfd98
+#define S5P_FIMV_E_RC_QP_BOUND_PB_V16		0xf7a0
+
+/* x and y are the picture dimensions in 32x32 encoding units. */
+#define ENC_V160_VP9_ME_SIZE(x, y) \
+	(((((x) * 2) + 3) * (((y) * 2) + 3) * 128) + \
+	 ((((y) * 256) + 2304) * ((x) + 1) / 2))
+
+/* The RISC maps its registers above this firmware-relative memory window. */
+#define MFC_V16_MEM_WINDOW_SIZE			0xf0000000ULL
+
+#endif /* _REGS_MFC_V16_H */

@@ -479,8 +479,16 @@ static struct exynos_iommu_domain *to_exynos_domain(struct iommu_domain *dom)
 	return container_of(dom, struct exynos_iommu_domain, domain);
 }
 
+/*
+ * v9 has no legacy CTRL/STATUS block handshake (__sysmmu_enable skips it too);
+ * its invalidation registers work on a live MMU, as in the vendor driver.
+ * Polling the old STATUS bit there cost ~2.5 s per MFC buffer teardown, and
+ * a poll that times out skips the flush.
+ */
 static void sysmmu_unblock(struct sysmmu_drvdata *data)
 {
+	if (MMU_MAJ_VER(data->version) == 9)
+		return;
 	writel(CTRL_ENABLE, data->sfrbase + REG_MMU_CTRL);
 }
 
@@ -488,6 +496,8 @@ static bool sysmmu_block(struct sysmmu_drvdata *data)
 {
 	int i = 120;
 
+	if (MMU_MAJ_VER(data->version) == 9)
+		return true;
 	writel(CTRL_BLOCK, data->sfrbase + REG_MMU_CTRL);
 	while ((i > 0) && !(readl(data->sfrbase + REG_MMU_STATUS) & 1))
 		--i;
@@ -657,8 +667,20 @@ static irqreturn_t exynos_sysmmu_irq(int irq, void *dev_id)
 		ret = report_iommu_fault(&data->domain->domain, data->master,
 					 fault.addr, fault.type);
 	}
-	if (ret)
-		panic("Unrecoverable System MMU Fault!");
+	if (ret) {
+		/*
+		 * The unit blocks the transaction before raising this, so the
+		 * access never reached memory and unblocking below simply
+		 * aborts it. Panicking loses the fault address printed just
+		 * above along with everything else, which on a board with no
+		 * way to capture a panic means the one piece of information
+		 * worth having is the piece that cannot be read. Report it and
+		 * let the master take the error instead; a driver whose DMA is
+		 * being refused will fail on its own terms and say so.
+		 */
+		dev_err_ratelimited(data->sysmmu,
+				    "fault left unhandled; aborting the access\n");
+	}
 
 out:
 	writel(1 << itype, SYSMMU_REG(data, int_clear));

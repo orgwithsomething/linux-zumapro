@@ -3,7 +3,10 @@
 #include <linux/bits.h>
 #include <linux/clk.h>
 #include <linux/component.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 
@@ -31,9 +34,6 @@
  *  G0      G1      G2      G3      GF0     GF1     VG0     VG1
  *  0x1000  0x2000  0x3000  0x4000  0x5000  0x6000  0x7000  0x8000
  */
-
-/* Channel order GF0, G0, VG0, G1, GF1, G2, VG1, G3 */
-static unsigned int channel_map[] = { 5, 1, 7, 2, 6, 3, 8, 4 };
 
 #define IDMA_ENABLE 0x0000
 #define IDMA_ASSIGNED_MO(_v) ((_v) << 24)
@@ -322,11 +322,11 @@ static u32 idma_img_format(u32 fourcc)
 	}
 }
 
-int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int channel,
+/* @idma is the physical channel: GF0 is 5, GF1 is 6 (block at idma * 0x1000). */
+int dpu_dma_update(struct exynos_dpu_dma_context *ctx, unsigned int idma,
 		   struct exynos_drm_plane_state *state)
 {
 	struct drm_framebuffer *fb = state->base.fb;
-	unsigned int idma = channel_map[channel];
 	dma_addr_t addr = exynos_drm_fb_dma_addr(fb, 0);
 
 	dma_reg_init(ctx, idma, 0);
@@ -366,6 +366,99 @@ static const struct component_ops dma_component_ops = {
 	.bind = dma_bind,
 };
 
+/* DECON0 GLOBAL_CON, see regs-decon-zuma.h. */
+#define QUIESCE_DECON0_MAIN	0x19470000
+#define QUIESCE_GLOBAL_CON	0x0020
+#define QUIESCE_DECON_EN_F	BIT(0)
+#define QUIESCE_DECON_EN	BIT(1)
+#define QUIESCE_RUN_STATUS	BIT(4)
+#define QUIESCE_IDLE_STATUS	BIT(5)
+#define QUIESCE_SRESET		BIT(28)
+
+static bool quiesce_boot_decon = true;
+module_param(quiesce_boot_decon, bool, 0444);
+MODULE_PARM_DESC(quiesce_boot_decon,
+		 "stop the bootloader's DECON before powering the DPU SysMMU");
+
+/*
+ * The bootloader hands the panel over with DECON0 still fetching, and enabling
+ * SysMMU translation under a live DMA master resets the SoC. Stop the fetch
+ * first. Done with a bare mapping rather than through the DECON driver, which
+ * probes later and does not own the hardware until it binds.
+ *
+ * Called from exynos_drm_init(), NOT from dpu_dma_probe(): the "iommus" link
+ * makes the SysMMU a supplier of this device, so really_probe() runs
+ * pm_runtime_get_suppliers() -- and with it __sysmmu_enable() -- before .probe
+ * is entered. Quiescing inside the probe is 100ms too late, which is exactly
+ * what the first version of this patch did.
+ */
+void dpu_dma_quiesce_boot_decon(void)
+{
+	void __iomem *main;
+	u32 val;
+	int ret;
+
+	if (!quiesce_boot_decon)
+		return;
+
+	main = ioremap(QUIESCE_DECON0_MAIN, 0x100);
+	if (!main) {
+		pr_warn("exynos-dpu: quiesce: cannot map DECON0\n");
+		return;
+	}
+
+	val = readl(main + QUIESCE_GLOBAL_CON);
+	if (!(val & QUIESCE_RUN_STATUS)) {
+		pr_info("exynos-dpu: quiesce: DECON0 already idle (%#x)\n", val);
+		goto out;
+	}
+
+	/*
+	 * DECON_EN_F is the per-frame off: it retires at the next frame
+	 * boundary, and in command mode that boundary needs a TE trigger the
+	 * self-refreshing DDIC is not sending. Clearing it alone leaves
+	 * GLOBAL_CON at 0x132 -- DECON_EN still set, RUN_STATUS still set --
+	 * which is what let the fetch run into the SysMMU enable.
+	 */
+	writel(val & ~(QUIESCE_DECON_EN_F | QUIESCE_DECON_EN),
+	       main + QUIESCE_GLOBAL_CON);
+
+	ret = readl_poll_timeout(main + QUIESCE_GLOBAL_CON, val,
+				 !(val & QUIESCE_RUN_STATUS), 100, 100000);
+	if (!ret) {
+		pr_info("exynos-dpu: quiesce: DECON0 stopped (%#x)\n", val);
+		goto out;
+	}
+
+	pr_warn("exynos-dpu: quiesce: DECON0 still running (%#x), SRESET\n", val);
+
+	/*
+	 * Only SRESET between frames. Resetting mid-frame -- IDLE_STATUS clear,
+	 * GLOBAL_CON 0x110 -- jams the DSIM: every DCS command to the DDIC then
+	 * times out (62 of them) and the panel stays dark. 0x130, idle, is the
+	 * state that hands over cleanly. Measured over six boots, the bit
+	 * predicted the outcome exactly.
+	 */
+	ret = readl_poll_timeout(main + QUIESCE_GLOBAL_CON, val,
+				 val & QUIESCE_IDLE_STATUS, 100, 100000);
+	if (ret)
+		pr_warn("exynos-dpu: quiesce: DECON0 never idle (%#x), SRESET anyway\n",
+			val);
+	else
+		pr_info("exynos-dpu: quiesce: DECON0 idle (%#x)\n", val);
+
+	writel(val | QUIESCE_SRESET, main + QUIESCE_GLOBAL_CON);
+	ret = readl_poll_timeout(main + QUIESCE_GLOBAL_CON, val,
+				 !(val & (QUIESCE_SRESET | QUIESCE_RUN_STATUS)),
+				 100, 100000);
+	if (ret)
+		pr_warn("exynos-dpu: quiesce: SRESET did not settle (%#x)\n", val);
+	else
+		pr_info("exynos-dpu: quiesce: DECON0 reset (%#x)\n", val);
+out:
+	iounmap(main);
+}
+
 static int dpu_dma_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -380,6 +473,23 @@ static int dpu_dma_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	platform_set_drvdata(pdev, ctx);
+
+	/*
+	 * Take the framebuffer pool if one is described.  Dumb buffers are
+	 * allocated physically contiguous, so each one needs a single run the
+	 * size of a screen; drawn from the global CMA they compete with every
+	 * other contiguous allocator on the SoC and eventually cannot be
+	 * assembled at all -- not for want of free pages, but because the ones
+	 * that are free cannot be migrated together.  A pool of our own is not
+	 * shared with those allocators, so the run is always there.
+	 *
+	 * Not fatal: without it allocations simply come from global CMA as
+	 * before.  of_dma_configure() only wires up restricted-dma-pool
+	 * automatically, so a shared-dma-pool has to be claimed here.
+	 */
+	ret = of_reserved_mem_device_init_by_idx(dev, dev->of_node, 0);
+	if (ret && ret != -ENODEV)
+		dev_warn(dev, "no framebuffer pool (%d); using global CMA\n", ret);
 
 	ctx->aclk = devm_clk_get_enabled(dev, "aclk");
 	if (IS_ERR(ctx->aclk))
@@ -403,13 +513,13 @@ static int dpu_dma_probe(struct platform_device *pdev)
 	if (!ctx->regs)
 		return -ENOMEM;
 
+	/*
+	 * No reference is taken here. The SysMMU is a supplier of this device,
+	 * so a resume pulls it up with us -- and holding one from probe pinned
+	 * pd-dpuf0, and through it pd-dpub, for the lifetime of the driver. The
+	 * CRTC takes the reference across its enable window instead.
+	 */
 	pm_runtime_enable(dev);
-	/* For turn on attached SYSMMU */
-	ret = pm_runtime_resume_and_get(dev);
-	if (ret < 0) {
-		pm_runtime_disable(dev);
-		return ret;
-	}
 
 	component_add(dev, &dma_component_ops);
 

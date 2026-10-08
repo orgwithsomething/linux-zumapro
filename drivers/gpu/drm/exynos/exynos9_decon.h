@@ -100,6 +100,7 @@ struct decon_config {
 	unsigned int out_bpc;
 	struct decon_mode mode;
 	unsigned int fps;
+	const struct drm_dsc_config *dsc;
 };
 
 struct win_color_map {
@@ -133,7 +134,11 @@ struct decon_context {
 	struct clk *aclk;
 
 	u32 irq_fd; /* frame done */
+	/* tracks irq_fd's masking, which disable_irq() nests */
+	bool enabled;
 	int te_irq; /* panel hardware TE, drives vblank in command mode */
+	/* completes the vblank when a command-mode frame never starts */
+	struct timer_list vblank_timer;
 
 	/* device ops */
 	const struct decon_cal_ops *cal_ops;
@@ -168,6 +173,8 @@ struct decon_cal_ops {
 			      struct decon_win_config *config);
 	void (*disable_window)(struct decon_context *ctx, u32 win_idx);
 	void (*win_update_req)(struct decon_context *ctx, u32 win_idx);
+	/* debug: INT_PEND in the low half, INT_PEND_EXTRA in the high half */
+	u32 (*int_pend)(struct decon_context *ctx);
 	u32 (*win_status)(struct decon_context *ctx, u32 win_idx);
 	u32 (*win_update_req_get)(struct decon_context *ctx, u32 win_idx);
 	void (*update_req_global)(struct decon_context *ctx);

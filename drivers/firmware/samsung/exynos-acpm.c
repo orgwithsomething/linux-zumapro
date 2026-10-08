@@ -215,94 +215,126 @@ static void acpm_get_saved_rx(struct acpm_chan *achan,
 }
 
 /**
- * acpm_get_rx() - get response from RX queue.
+ * acpm_get_rx() - drain the RX queue, optionally on behalf of one transfer.
  * @achan:	ACPM channel info.
- * @xfer:	reference to the transfer to get response for.
+ * @xfer:	reference to the transfer to get response for, or NULL to drain
+ *		the queue without an owning transfer.
  * @native_match: pointer to a boolean set to true if the thread natively
- *                processed its own sequence number during this call.
+ *                processed its own sequence number during this call.  NULL
+ *                when there is no owning transfer.
+ *
+ * Every queued response is cached against its own sequence number and RX rear
+ * is advanced to the sampled RX front, so the firmware always finds room to
+ * append its next reply.  Ownership of a sequence number stays with the thread
+ * that allocated it: the bitmap bit is cleared only once that thread has
+ * copied the payload out, whether it drained the entry itself or found it
+ * cached.  The channel's incoming mailbox status is acknowledged afterwards:
+ * every channel's interrupt is masked, so nothing else ever clears it.
  *
  * Return: 0 on success, -errno otherwise.
  */
 static int acpm_get_rx(struct acpm_chan *achan, const struct acpm_xfer *xfer,
 		       bool *native_match)
 {
-	u32 rx_front, rx_seqnum, tx_seqnum, seqnum;
+	u32 rx_front, rx_seqnum, tx_seqnum = 0, seqnum;
 	const void __iomem *base, *addr;
 	struct acpm_rx_data *rx_data;
+	bool matched = false;
 	u32 i, val, mlen;
+	int ret;
 
-	*native_match = false;
+	scoped_guard(mutex, &achan->rx_lock) {
+		rx_front = readl(achan->rx.front);
+		i = readl(achan->rx.rear);
 
-	guard(mutex)(&achan->rx_lock);
+		if (xfer)
+			tx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM,
+					      xfer->txd[0]);
 
-	rx_front = readl(achan->rx.front);
-	i = readl(achan->rx.rear);
+		base = achan->rx.base;
+		mlen = achan->mlen;
 
-	tx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, xfer->txd[0]);
+		/* Drain RX queue. */
+		while (i != rx_front) {
+			/* Read RX seqnum. */
+			addr = base + mlen * i;
+			val = readl(addr);
 
-	if (i == rx_front)
-		return 0;
+			rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, val);
+			if (!rx_seqnum) {
+				dev_err_ratelimited(achan->acpm->dev,
+						    "ch:%u invalid RX seqnum, slot %u: %08x\n",
+						    achan->id, i, val);
+				return -EIO;
+			}
+			/*
+			 * mssg seqnum starts with value 1, whereas the driver
+			 * considers the first mssg at index 0.
+			 */
+			seqnum = rx_seqnum - 1;
+			rx_data = &achan->rx_data[seqnum];
 
-	base = achan->rx.base;
-	mlen = achan->mlen;
-
-	/* Drain RX queue. */
-	do {
-		/* Read RX seqnum. */
-		addr = base + mlen * i;
-		val = readl(addr);
-
-		rx_seqnum = FIELD_GET(ACPM_PROTOCOL_SEQNUM, val);
-		if (!rx_seqnum)
-			return -EIO;
-		/*
-		 * mssg seqnum starts with value 1, whereas the driver considers
-		 * the first mssg at index 0.
-		 */
-		seqnum = rx_seqnum - 1;
-		rx_data = &achan->rx_data[seqnum];
-
-		if (rx_data->rxcnt) {
-			if (rx_seqnum == tx_seqnum) {
-				__ioread32_copy(xfer->rxd, addr, xfer->rxcnt);
-				/*
-				 * Signal completion to the polling thread.
-				 * Pairs with smp_load_acquire() in polling
-				 * loop.
-				 */
-				smp_store_release(&rx_data->completed, true);
-				*native_match = true;
+			if (rx_data->rxcnt) {
+				if (xfer && rx_seqnum == tx_seqnum) {
+					__ioread32_copy(xfer->rxd, addr,
+							xfer->rxcnt);
+					/*
+					 * Signal completion to the polling
+					 * thread. Pairs with
+					 * smp_load_acquire() in polling loop.
+					 */
+					smp_store_release(&rx_data->completed,
+							  true);
+					matched = true;
+				} else {
+					/*
+					 * The RX data corresponds to another
+					 * request. Save the data to drain the
+					 * queue, but don't clear yet the
+					 * bitmap. It will be cleared after the
+					 * response is copied to the request.
+					 */
+					__ioread32_copy(rx_data->cmd, addr,
+							rx_data->rxcnt);
+					/*
+					 * Signal completion to the polling
+					 * thread. Pairs with
+					 * smp_load_acquire() in polling loop.
+					 */
+					smp_store_release(&rx_data->completed,
+							  true);
+				}
 			} else {
 				/*
-				 * The RX data corresponds to another request.
-				 * Save the data to drain the queue, but don't
-				 * clear yet the bitmap. It will be cleared
-				 * after the response is copied to the request.
-				 */
-				__ioread32_copy(rx_data->cmd, addr,
-						rx_data->rxcnt);
-				/*
 				 * Signal completion to the polling thread.
 				 * Pairs with smp_load_acquire() in polling
 				 * loop.
 				 */
 				smp_store_release(&rx_data->completed, true);
+				if (xfer && rx_seqnum == tx_seqnum)
+					matched = true;
 			}
-		} else {
-			/*
-			 * Signal completion to the polling thread.
-			 * Pairs with smp_load_acquire() in polling loop.
-			 */
-			smp_store_release(&rx_data->completed, true);
-			if (rx_seqnum == tx_seqnum)
-				*native_match = true;
+
+			i = (i + 1) % achan->qlen;
 		}
 
-		i = (i + 1) % achan->qlen;
-	} while (i != rx_front);
+		/* We saved all responses, mark RX empty. */
+		writel(rx_front, achan->rx.rear);
+	}
 
-	/* We saved all responses, mark RX empty. */
-	writel(rx_front, achan->rx.rear);
+	/*
+	 * Acknowledge this channel unconditionally, as the vendor driver does
+	 * after every receive: an empty queue still leaves the status bit of
+	 * the reply that emptied it asserted.
+	 */
+	ret = exynos_mbox_clear_chan_irq(achan->chan, achan->id);
+	if (ret)
+		dev_warn_once(achan->acpm->dev,
+			      "ch:%u incoming status not acknowledged: %d\n",
+			      achan->id, ret);
+
+	if (native_match)
+		*native_match = matched;
 
 	return 0;
 }
@@ -367,13 +399,15 @@ static int acpm_dequeue_by_polling(struct acpm_chan *achan,
  */
 static int acpm_wait_for_queue_slots(struct acpm_chan *achan, u32 next_tx_front)
 {
+	u32 reserved_front = (next_tx_front + 1) % achan->qlen;
 	u32 val, ret;
 
 	/*
-	 * Wait for RX front to keep up with TX front. Make sure there's at
-	 * least one element between them.
+	 * Wait for RX front to keep up with TX front.  Downstream reserves two
+	 * elements so ACPM can never observe a completely full request queue;
+	 * this limits a three-entry channel to one in-flight transaction.
 	 */
-	ret = readl_poll_timeout(achan->rx.front, val, next_tx_front != val, 0,
+	ret = readl_poll_timeout(achan->rx.front, val, reserved_front != val, 0,
 				 ACPM_TX_TIMEOUT_US);
 	if (ret) {
 		dev_err(achan->acpm->dev, "RX front can not keep up with TX front.\n");
@@ -482,6 +516,8 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		dev_err(achan->acpm->dev, "Interrupt mode not supported\n");
 		return -EOPNOTSUPP;
 	}
+	if (achan->qlen < 3)
+		return -EIO;
 
 	msg.chan_id = xfer->acpm_chan_id;
 	msg.chan_type = EXYNOS_MBOX_CHAN_TYPE_DOORBELL;
@@ -491,6 +527,18 @@ int acpm_do_xfer(struct acpm_handle *handle, const struct acpm_xfer *xfer)
 		idx = (tx_front + 1) % achan->qlen;
 
 		ret = acpm_wait_for_queue_slots(achan, idx);
+		if (ret)
+			return ret;
+
+		/*
+		 * Drain the responses the firmware has already queued before
+		 * publishing another request, the way the vendor driver does.
+		 * The reservation above bounds the requests in flight, not the
+		 * replies sitting behind RX rear: leaving those queued lets the
+		 * firmware find its response ring full, which it reports as
+		 * "qfull" and answers by parking that plugin context forever.
+		 */
+		ret = acpm_get_rx(achan, NULL, NULL);
 		if (ret)
 			return ret;
 

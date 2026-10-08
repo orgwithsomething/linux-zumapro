@@ -27,6 +27,7 @@
 &cont_splash_mem {
 	// reg = <0x0 0xfac00000 (1440 * 3120 * 4)>;
 	reg = <0x0 0xfac00000 (1080 * 2424 * 4)>;
+
 	status = "okay";
 };
 
@@ -38,12 +39,6 @@
 	height = <2424>;
 	stride = <(1080 * 4)>;
 	format = "a8r8g8b8";
-	status = "okay";
-};
 
-&spitouch {
-	st,dchip_id = /bits/ 8 <0x36 0x48>;
-	st,max-coords = <1079 2399>;
-	st,udfps-coords = <540 1769>;
-	st,touch_offload_id = /bits/ 8 <'0' '0' 'o' '6'>;
+	status = "okay";
 };

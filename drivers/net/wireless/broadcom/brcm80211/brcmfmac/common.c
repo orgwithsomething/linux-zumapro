@@ -76,7 +76,32 @@ MODULE_PARM_DESC(fcmode, "Mode of firmware signalled flow control");
  * (legacy behaviour, kept only for A/B bisecting the trap). */
 static int brcmf_mpc = -1;
 module_param_named(mpc, brcmf_mpc, int, 0644);
-MODULE_PARM_DESC(mpc, "Minimize Power Consumption at preinit: -1=leave firmware self-preinit default (default, true vendor parity, avoids the BCM4390 idle-5GHz VCO-cal trap), 0=force off, 1=force on");
+MODULE_PARM_DESC(mpc, "Minimize Power Consumption at preinit: -1=leave firmware self-preinit default (default, true vendor parity), 0=force off, 1=force on. NOTE mpc=1 also suppresses the BCM4390 wl2 VCO-cal trap (0/12 runs vs 8/12 at the default) but costs ~25% throughput; btc_mode is the real fix for that");
+
+/* BT coexistence at preinit. Default -1 leaves the nvram value alone, which is
+ * what the vendor driver does -- bcmdhd never writes this iovar at all, and the
+ * caiman/komodo nvram asks for coex ON (btc_mode=0x1).
+ *
+ * This used to be forced to 0 unconditionally, to stop the coex CPU's TX
+ * overrides faulting txq_hw_fill (NULL deref) under sustained TX. That write is
+ * what caused the idle-5GHz slice (wl2) to take a VCO-cal trap within ~25 s of
+ * associating: 36-run interleaved A/B, 8 traps in 12 runs at btc_mode=0 against
+ * 0 in 12 at btc_mode=1 (Fisher p ~ 0.0009), and the trap takes the whole
+ * datapath with it -- `iw dev ... link` then returns EIO while cfg80211 still
+ * reports the link up.
+ *
+ * The reasoning for the old write does not survive the dongle console: it argued
+ * the coex CPU has no firmware loaded, but the dongle resets, downloads and
+ * starts that CPU itself out of the same firmware package, before any host BT
+ * stack exists ("Coex cpu start", "SR Coex version: 2.0"). On BCM4390 that CPU
+ * arbitrates between the radio slices, not just against Bluetooth.
+ *
+ * The sustained-TX stall is real but is NOT coex-related: it reproduces with
+ * coex off (mpc=1 arm, stalled at ~13 GB) as well as on (~6 GB). Separate bug.
+ */
+static int brcmf_btc_mode = -1;
+module_param_named(btc_mode, brcmf_btc_mode, int, 0644);
+MODULE_PARM_DESC(btc_mode, "BT coexistence at preinit: -1=leave nvram value (default, vendor parity), 0=force off (reintroduces the BCM4390 wl2 VCO-cal trap), 1=force on");
 
 /* Power-save (WLC_SET_PM) at config-dongle. The vendor DHD's optimised (fw
  * self-preinit) path does NOT set PM -- it leaves the firmware default -- while
@@ -119,6 +144,36 @@ MODULE_PARM_DESC(percal, "Firmware periodic PHY cal (phy_percal): -1=fw default 
 static int brcmf_phy_wd = -1;
 module_param_named(phy_wd, brcmf_phy_wd, int, 0644);
 MODULE_PARM_DESC(phy_wd, "Firmware PHY watchdog + noise metric: -1=fw default (default), 0=disable all periodic PHY maintenance");
+
+/* Generic iovar lever, applied at the end of preinit:
+ * brcmfmac.iovars="name=val,name2:8=val2". Integer values, little endian, with
+ * a selectable payload width; each result is logged and a bad pair is skipped
+ * rather than aborting the rest.
+ *
+ * Why this exists: the iovar set is firmware-build specific, and guessing wrong
+ * used to cost a kernel rebuild each time. On BCM4390 27.10.1121.57.18,
+ * phy_watchdog / phy_percal / noise_metric / phymsglevel do NOT exist (all
+ * -EBADE), while radio_health_check and phycal_tempdelta do -- verified against
+ * the firmware's own iovar table. Combined with the params being 0644 and
+ * preinit re-running on a PCI remove/rescan, a hypothesis is now a sysfs write
+ * plus a rescan instead of a build.
+ *
+ * Read the return code, not just the symptom: a wrong payload width also gives
+ * -EBADE, so a setting can look applied while doing nothing.
+ *
+ * Diagnostic only: nothing here should be relied on in a shipping config. */
+static char brcmf_iovars[256];
+module_param_string(iovars, brcmf_iovars, sizeof(brcmf_iovars), 0644);
+MODULE_PARM_DESC(iovars, "Comma-separated iovars set at preinit: name=val (4 bytes) or name:N=val (N=1/2/4/8, LE), e.g. \"rsdb_mode:8=0\". Diagnostic.");
+
+/* Same syntax, but applied after WLC_UP in brcmf_config_dongle(). Preinit runs
+ * before the interface is up, and an iovar that needs it up fails there with
+ * BCME_NOTUP (-4) -- which brcmfmac flattens to the same -EBADE as "no such
+ * iovar", so it looks tested when it never ran. radio_health_check is exactly
+ * that case. Diagnostic only. */
+static char brcmf_iovars_up[256];
+module_param_string(iovars_up, brcmf_iovars_up, sizeof(brcmf_iovars_up), 0644);
+MODULE_PARM_DESC(iovars_up, "Like iovars, but applied after the interface is up (for iovars that return BCME_NOTUP at preinit). Diagnostic.");
 
 /* TX A-MSDU. The BCM4390 firmware self-preinits the TX-aggregation config
  * (A-MSDU, ampdu_mpdu depth, ampdu_ba_wsize) as one set sized to its SAQM
@@ -382,6 +437,79 @@ static int brcmf_c_process_cal_blob(struct brcmf_if *ifp)
 	return err;
 }
 
+/* Apply the brcmfmac.iovars= list. Parses a private copy: the module-param
+ * buffer stays writable through sysfs, so it must not be tokenised in place.
+ *
+ * "name=val" sends the default 4 bytes; "name:N=val" sends N (1/2/4/8), little
+ * endian, zero padded. The width matters -- the firmware rejects a wrong-sized
+ * payload with -EBADE and the setting silently does nothing. rsdb_mode is the
+ * case in point: it takes wl_config_t {u32 config; u32 status}, so disabling
+ * RSDB the way the vendor DHD does is "rsdb_mode:8=0", not "rsdb_mode=0".
+ */
+static void brcmf_c_apply_iovars(struct brcmf_if *ifp, const char *list,
+				 const char *phase)
+{
+	struct brcmf_pub *drvr = ifp->drvr;
+	char *buf, *pos, *pair;
+
+	if (!list[0])
+		return;
+
+	buf = kstrdup(list, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	pos = buf;
+	while ((pair = strsep(&pos, ",")) != NULL) {
+		char *name = strim(pair);
+		char *width, *val = strchr(name, '=');
+		__le64 le;
+		u32 len = 4;
+		s64 v;
+		int err;
+
+		if (!val)
+			continue;
+		*val++ = '\0';
+
+		width = strchr(name, ':');
+		if (width) {
+			*width++ = '\0';
+			if (kstrtou32(strim(width), 0, &len) ||
+			    (len != 1 && len != 2 && len != 4 && len != 8)) {
+				bphy_err(drvr, "DBG iovars: %s: bad width\n",
+					 name);
+				continue;
+			}
+		}
+
+		name = strim(name);
+		if (!*name)
+			continue;
+		if (kstrtos64(strim(val), 0, &v)) {
+			bphy_err(drvr, "DBG iovars: %s: bad value\n", name);
+			continue;
+		}
+
+		le = cpu_to_le64((u64)v);
+		err = brcmf_fil_iovar_data_set(ifp, name, &le, len);
+		bphy_err(drvr, "DBG iovars[%s]: %s:%u=%lld -> %d\n", phase, name,
+			 len, v, err);
+	}
+
+	kfree(buf);
+}
+
+static void brcmf_c_set_extra_iovars(struct brcmf_if *ifp)
+{
+	brcmf_c_apply_iovars(ifp, brcmf_iovars, "preinit");
+}
+
+void brcmf_c_set_extra_iovars_up(struct brcmf_if *ifp)
+{
+	brcmf_c_apply_iovars(ifp, brcmf_iovars_up, "up");
+}
+
 int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 {
 	struct brcmf_pub *drvr = ifp->drvr;
@@ -521,8 +649,13 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 		brcmf_dbg(INFO, "CLM version = %s\n", clmver);
 	}
 
-	/* mpc: default -1 leaves the firmware self-preinit value untouched (vendor
-	 * parity, avoids the idle-5GHz VCO-cal trap); only force it if asked. */
+	/* mpc: default -1 leaves the firmware self-preinit value untouched, which is
+	 * vendor parity -- bcmdhd does not set mpc at bring-up either (its only two
+	 * call sites are in dhd_deepsleep(), under SUPPORT_DEEP_SLEEP, not built).
+	 * It does NOT avoid the idle-5GHz VCO-cal trap: -1 is the value that traps,
+	 * ~85% of runs within 25-43 s of the interface coming up. mpc=1 is what stops
+	 * it (939 s / 2 GB clean, A/B/A'd) at ~25% throughput, so it is a workaround
+	 * and not what the vendor does. Only force it if asked. */
 	if (brcmf_mpc >= 0) {
 		err = brcmf_fil_iovar_int_set(ifp, "mpc", brcmf_mpc);
 		if (err) {
@@ -548,6 +681,8 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 		bphy_err(drvr, "DBG phy_wd=%d: noise_metric -> %d\n", brcmf_phy_wd,
 			 brcmf_fil_iovar_int_set(ifp, "noise_metric", brcmf_phy_wd));
 	}
+
+	brcmf_c_set_extra_iovars(ifp);
 
 	brcmf_c_set_joinpref_default(ifp);
 
@@ -619,14 +754,12 @@ int brcmf_c_preinit_dcmds(struct brcmf_if *ifp)
 	 */
 
 
-	/* Disable BT coexistence. The komodo NVRAM enables it (btc_mode=0x1),
-	 * but when the companion Bluetooth core has no firmware loaded the WLAN
-	 * coex CPU spins on failed IPC to it ("BTCX override IPC err") and its
-	 * TX overrides leave the MAC hardware queue half-configured, faulting
-	 * txq_hw_fill (NULL deref) under sustained TX. With no BT to coexist
-	 * with, turn coex off so it stops touching the TX path.
+	/* BT coexistence: default -1 leaves the nvram value alone, which is what
+	 * the vendor driver does. Forcing it off here is what caused the BCM4390
+	 * idle-5GHz (wl2) VCO-cal trap -- see the brcmf_btc_mode comment above.
 	 */
-	(void)brcmf_fil_iovar_int_set(ifp, "btc_mode", 0);
+	if (brcmf_btc_mode >= 0)
+		(void)brcmf_fil_iovar_int_set(ifp, "btc_mode", brcmf_btc_mode);
 
 done:
 	return err;

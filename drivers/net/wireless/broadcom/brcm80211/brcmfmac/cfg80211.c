@@ -41,6 +41,13 @@
 
 #define BRCMF_SCAN_IE_LEN_MAX		2048
 
+#define BRCMF_WOWL_ANY_FILTER_ID	100
+#define BRCMF_APF_FILTER_ID		200
+#define BRCMF_PKT_FILTER_TYPE_PATTERN_MATCH	0
+#define BRCMF_PKT_FILTER_TYPE_APF_MATCH		4
+#define BRCMF_PKT_FILTER_MODE_FORWARD_ON_MATCH	1
+#define BRCMF_APF_INTERNAL_VERSION		1
+
 #define WPA_OUI				"\x00\x50\xF2"	/* WPA OUI */
 #define WPA_OUI_TYPE			1
 #define RSN_OUI				"\x00\x0F\xAC"	/* RSN OUI */
@@ -1388,6 +1395,83 @@ static int brcmf_set_pmk(struct brcmf_if *ifp, const u8 *pmk_data, u16 pmk_len)
 	return brcmf_set_wsec(ifp, pmk_data, pmk_len, 0);
 }
 
+static int brcmf_apf_cleanup_locked(struct brcmf_cfg80211_vif *vif,
+				    bool firmware_available);
+
+static void brcmf_free_apf_program_locked(struct brcmf_cfg80211_vif *vif)
+{
+	lockdep_assert_held(&vif->apf_mutex);
+
+	kfree(vif->apf_program);
+	vif->apf_program = NULL;
+	vif->apf_program_len = 0;
+}
+
+static int brcmf_clear_apf_program(struct brcmf_cfg80211_vif *vif,
+				   bool firmware_available)
+{
+	int err;
+
+	mutex_lock(&vif->apf_mutex);
+	err = brcmf_apf_cleanup_locked(vif, firmware_available);
+	brcmf_free_apf_program_locked(vif);
+	mutex_unlock(&vif->apf_mutex);
+
+	return err;
+}
+
+int brcmf_set_apf_program(struct brcmf_if *ifp, const u8 *program,
+			  u32 program_len)
+{
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	u8 *program_copy = NULL;
+	bool firmware_available;
+	u32 max_len;
+	int err;
+
+	mutex_lock(&vif->apf_mutex);
+
+	/* An attempted replacement invalidates the old L3-specific program. */
+	brcmf_free_apf_program_locked(vif);
+	firmware_available = ifp->drvr->bus_if->state == BRCMF_BUS_UP;
+	err = brcmf_apf_cleanup_locked(vif, firmware_available);
+	if (err || !program_len)
+		goto out;
+
+	if (!program || program_len > U16_MAX) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
+		err = -ENOTCONN;
+		goto out;
+	}
+
+	err = brcmf_fil_iovar_int_get(ifp, "apf_size_limit", &max_len);
+	if (err)
+		goto out;
+
+	if (program_len > max_len) {
+		err = -E2BIG;
+		goto out;
+	}
+
+	program_copy = kmemdup(program, program_len, GFP_KERNEL);
+	if (!program_copy) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	vif->apf_program = program_copy;
+	vif->apf_program_len = program_len;
+	err = 0;
+
+out:
+	mutex_unlock(&vif->apf_mutex);
+	return err;
+}
+
 static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 			    bool locally_generated)
 {
@@ -1399,6 +1483,10 @@ static void brcmf_link_down(struct brcmf_cfg80211_vif *vif, u16 reason,
 	brcmf_dbg(TRACE, "Enter\n");
 
 	if (test_and_clear_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
+		err = brcmf_clear_apf_program(vif, bus_up);
+		if (err)
+			bphy_err(drvr, "failed to clear APF packet filter: %d\n",
+				 err);
 		if (bus_up) {
 			brcmf_dbg(INFO, "Call WLC_DISASSOC to stop excess roaming\n");
 			err = brcmf_fil_cmd_data_set(vif->ifp,
@@ -2371,6 +2459,7 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	struct brcmf_cfg80211_profile *profile = &ifp->vif->profile;
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_scb_val_le scbval;
+	s32 apf_err;
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter. Reason code = %d\n", reason_code);
@@ -2381,6 +2470,10 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 	clear_bit(BRCMF_VIF_STATUS_CONNECTING, &ifp->vif->sme_state);
 	clear_bit(BRCMF_VIF_STATUS_EAP_SUCCESS, &ifp->vif->sme_state);
 	clear_bit(BRCMF_VIF_STATUS_ASSOC_SUCCESS, &ifp->vif->sme_state);
+	apf_err = brcmf_clear_apf_program(ifp->vif, true);
+	if (apf_err)
+		bphy_err(drvr, "failed to clear APF packet filter: %d\n",
+			 apf_err);
 	cfg80211_disconnected(ndev, reason_code, NULL, 0, true, GFP_KERNEL);
 
 	memcpy(&scbval.ea, &profile->bssid, ETH_ALEN);
@@ -2389,6 +2482,8 @@ brcmf_cfg80211_disconnect(struct wiphy *wiphy, struct net_device *ndev,
 				     &scbval, sizeof(scbval));
 	if (err)
 		bphy_err(drvr, "error (%d)\n", err);
+	else
+		err = apf_err;
 
 	brcmf_dbg(TRACE, "Exit\n");
 	return err;
@@ -4040,23 +4135,274 @@ static void brcmf_report_wowl_wakeind(struct wiphy *wiphy, struct brcmf_if *ifp)
 
 #endif /* CONFIG_PM */
 
+static int brcmf_apf_config_filter(struct brcmf_if *ifp, bool enable)
+{
+	struct brcmf_pkt_filter_enable_le filter = {
+		.id = cpu_to_le32(BRCMF_APF_FILTER_ID),
+		.enable = cpu_to_le32(enable),
+	};
+
+	return brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &filter,
+					  sizeof(filter));
+}
+
+static int brcmf_apf_delete_filter(struct brcmf_if *ifp)
+{
+	return brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete",
+				       BRCMF_APF_FILTER_ID);
+}
+
+static int brcmf_apf_disable_locked(struct brcmf_cfg80211_vif *vif)
+{
+	int err;
+
+	lockdep_assert_held(&vif->apf_mutex);
+
+	if (!vif->apf_filter_enabled)
+		return 0;
+
+	err = brcmf_apf_config_filter(vif->ifp, false);
+	if (!err) {
+		vif->apf_filter_enabled = false;
+		return 0;
+	}
+
+	/* Deleting is a safe fallback if firmware rejected disable. */
+	if (vif->apf_filter_installed &&
+	    !brcmf_apf_delete_filter(vif->ifp)) {
+		vif->apf_filter_installed = false;
+		vif->apf_filter_enabled = false;
+		return 0;
+	}
+
+	return err;
+}
+
+static int brcmf_apf_cleanup_locked(struct brcmf_cfg80211_vif *vif,
+				    bool firmware_available)
+{
+	int err;
+
+	lockdep_assert_held(&vif->apf_mutex);
+
+	if (!firmware_available) {
+		vif->apf_filter_installed = false;
+		vif->apf_filter_enabled = false;
+		return 0;
+	}
+
+	err = brcmf_apf_disable_locked(vif);
+	if (err)
+		return err;
+
+	if (!vif->apf_filter_installed)
+		return 0;
+
+	err = brcmf_apf_delete_filter(vif->ifp);
+	if (!err) {
+		vif->apf_filter_installed = false;
+		vif->apf_filter_enabled = false;
+	}
+
+	return err;
+}
+
+static int brcmf_apf_disable(struct brcmf_cfg80211_vif *vif)
+{
+	int err;
+
+	mutex_lock(&vif->apf_mutex);
+	err = brcmf_apf_disable_locked(vif);
+	mutex_unlock(&vif->apf_mutex);
+
+	return err;
+}
+
+static int brcmf_apf_download(struct brcmf_if *ifp, const u8 *data, u32 len)
+{
+	struct brcmf_dload_data_le *chunk_buf;
+	u32 remaining = len;
+	u32 offset = 0;
+	u32 buf_len;
+	u16 dl_flag = DL_BEGIN;
+	int err = 0;
+
+	buf_len = ALIGN(struct_size(chunk_buf, data, MAX_CHUNK_LEN), 8);
+	chunk_buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!chunk_buf)
+		return -ENOMEM;
+
+	while (remaining) {
+		u32 chunk_len = min_t(u32, remaining, MAX_CHUNK_LEN);
+		u32 dload_len = ALIGN(struct_size(chunk_buf, data, chunk_len), 8);
+
+		memset(chunk_buf, 0, dload_len);
+		if (chunk_len == remaining)
+			dl_flag |= DL_END;
+		chunk_buf->flag =
+			cpu_to_le16((DLOAD_HANDLER_VER << DLOAD_FLAG_VER_SHIFT) |
+				    dl_flag);
+		chunk_buf->dload_type = cpu_to_le16(DL_TYPE_DRRBLOB);
+		chunk_buf->len = cpu_to_le32(chunk_len);
+		memcpy(chunk_buf->data, data + offset, chunk_len);
+
+		err = brcmf_fil_iovar_data_set(ifp, "apf_pkt_dload",
+					       chunk_buf, dload_len);
+		if (err)
+			break;
+
+		dl_flag &= ~DL_BEGIN;
+		offset += chunk_len;
+		remaining -= chunk_len;
+	}
+
+	kfree(chunk_buf);
+	return err;
+}
+
+static int brcmf_apf_install_locked(struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_vif *vif = ifp->vif;
+	struct brcmf_pkt_filter_le *filter;
+	struct brcmf_apf_program_le *apf;
+	u32 filter_len;
+	u32 max_len;
+	int err;
+
+	lockdep_assert_held(&vif->apf_mutex);
+
+	if (!vif->apf_program || !vif->apf_program_len)
+		return -ENOENT;
+
+	err = brcmf_fil_iovar_int_get(ifp, "apf_size_limit", &max_len);
+	if (err)
+		return err;
+	if (vif->apf_program_len > max_len)
+		return -E2BIG;
+
+	filter_len = offsetof(struct brcmf_pkt_filter_le,
+			      u.apf_program.instrs) + vif->apf_program_len;
+	filter = kzalloc(filter_len, GFP_KERNEL);
+	if (!filter)
+		return -ENOMEM;
+
+	filter->id = cpu_to_le32(BRCMF_APF_FILTER_ID);
+	filter->type = cpu_to_le32(BRCMF_PKT_FILTER_TYPE_APF_MATCH);
+	apf = &filter->u.apf_program;
+	apf->version = cpu_to_le16(BRCMF_APF_INTERNAL_VERSION);
+	apf->instr_len = cpu_to_le16(vif->apf_program_len);
+	memcpy(apf->instrs, vif->apf_program, vif->apf_program_len);
+
+	err = brcmf_apf_download(ifp, (u8 *)filter, filter_len);
+	kfree(filter);
+	return err;
+}
+
+static int brcmf_apf_arm(struct brcmf_cfg80211_vif *vif, bool *armed)
+{
+	int cleanup_err;
+	int err;
+
+	*armed = false;
+
+	mutex_lock(&vif->apf_mutex);
+
+	err = brcmf_apf_cleanup_locked(vif, true);
+	if (err || !vif->apf_program)
+		goto out;
+
+	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &vif->sme_state)) {
+		err = -ENOTCONN;
+		goto out;
+	}
+
+	err = brcmf_apf_install_locked(vif->ifp);
+	if (err)
+		goto cleanup;
+	vif->apf_filter_installed = true;
+
+	/* Treat an enable error as indeterminate and force cleanup. */
+	vif->apf_filter_enabled = true;
+	err = brcmf_apf_config_filter(vif->ifp, true);
+	if (!err) {
+		*armed = true;
+		goto out;
+	}
+
+cleanup:
+	cleanup_err = brcmf_apf_cleanup_locked(vif, true);
+	if (cleanup_err)
+		err = cleanup_err;
+out:
+	mutex_unlock(&vif->apf_mutex);
+	return err;
+}
+
 static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 {
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
+	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
 	if (cfg->wowl.active) {
-		brcmf_report_wowl_wakeind(wiphy, ifp);
-		brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
-		brcmf_config_wowl_pattern(ifp, "clr", NULL, 0, NULL, 0);
-		if (!brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ARP_ND))
-			brcmf_configure_arp_nd_offload(ifp, true);
-		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
-				      cfg->wowl.pre_pmmode);
-		cfg->wowl.active = false;
+		struct brcmf_pkt_filter_enable_le filter = {
+			.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID),
+			.enable = cpu_to_le32(0),
+		};
+		s32 pm_err;
+
+		if (!cfg->wowl.any) {
+			brcmf_report_wowl_wakeind(wiphy, ifp);
+			brcmf_fil_iovar_int_set(ifp, "wowl_clear", 0);
+			brcmf_config_wowl_pattern(ifp, "clr", NULL, 0,
+						 NULL, 0);
+			if (!brcmf_feat_is_enabled(ifp,
+						   BRCMF_FEAT_WOWL_ARP_ND))
+				brcmf_configure_arp_nd_offload(ifp, true);
+			brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+					      cfg->wowl.pre_pmmode);
+			cfg->wowl.active = false;
+		} else {
+			pm_err = brcmf_apf_disable(ifp->vif);
+			if (pm_err) {
+				bphy_err(cfg->pub,
+					 "failed to disable APF packet filter: %d\n",
+					 pm_err);
+				err = pm_err;
+			}
+
+			if (cfg->wowl.any_filter_enabled) {
+				pm_err = brcmf_fil_iovar_data_set(ifp,
+								  "pkt_filter_enable",
+								  &filter,
+								  sizeof(filter));
+				if (pm_err) {
+					bphy_err(cfg->pub, "failed to disable wake-on-any packet filter: %d\n",
+						 pm_err);
+					if (!err)
+						err = pm_err;
+				} else {
+					cfg->wowl.any_filter_enabled = false;
+				}
+			}
+
+			pm_err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
+						    cfg->wowl.pre_pmmode);
+			if (pm_err) {
+				bphy_err(cfg->pub, "failed to restore power-save mode: %d\n",
+					 pm_err);
+				if (!err)
+					err = pm_err;
+			}
+
+			if (!err) {
+				cfg->wowl.active = false;
+				cfg->wowl.any = false;
+			}
+		}
 		if (cfg->wowl.nd_enabled) {
 			brcmf_cfg80211_sched_scan_stop(cfg->wiphy, ifp->ndev, 0);
 			brcmf_fweh_unregister(cfg->pub, BRCMF_E_PFN_NET_FOUND);
@@ -4065,7 +4411,7 @@ static s32 brcmf_cfg80211_resume(struct wiphy *wiphy)
 			cfg->wowl.nd_enabled = false;
 		}
 	}
-	return 0;
+	return err;
 }
 
 static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
@@ -4124,6 +4470,128 @@ static void brcmf_configure_wowl(struct brcmf_cfg80211_info *cfg,
 	cfg->wowl.active = true;
 }
 
+static int brcmf_configure_wowl_any(struct brcmf_cfg80211_info *cfg,
+				    struct brcmf_if *ifp)
+{
+	union {
+		struct brcmf_pkt_filter_le filter;
+		u8 data[offsetof(struct brcmf_pkt_filter_le,
+				 u.pattern.mask_and_pattern) + 2];
+	} filter_buf = {};
+	struct brcmf_pkt_filter_enable_le enable = {
+		.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID),
+		.enable = cpu_to_le32(1),
+	};
+	bool apf_armed;
+	int apf_err;
+	int err;
+
+	brcmf_dbg(TRACE, "Suspend, wake on any traffic.\n");
+
+	/* The unicast-only filter would break AP and P2P-GO service. */
+	if (brcmf_is_apmode_operating(cfg->wiphy)) {
+		brcmf_dbg(INFO, "refusing wake-on-any while AP mode is active\n");
+		return 1;
+	}
+
+	/* A program is expected to answer ARP and ping from firmware, and an
+	 * ARP request for our own address is broadcast, which is a frame the
+	 * unicast-only filter discards before the program can run. The two
+	 * therefore cannot both be enabled. Arming a program hands it the
+	 * group-address drop as well; the bytecode is opaque here, so that is
+	 * a contract on whoever installs it rather than something this driver
+	 * can check. The unicast filter stays the fallback for a suspend with
+	 * no program to arm.
+	 */
+	apf_err = brcmf_apf_arm(ifp->vif, &apf_armed);
+	if (apf_err) {
+		bphy_err(cfg->pub, "failed to arm APF packet filter: %d\n",
+			 apf_err);
+		apf_err = brcmf_apf_disable(ifp->vif);
+		if (apf_err) {
+			bphy_err(cfg->pub, "failed to clean up APF packet filter: %d\n",
+				 apf_err);
+			return apf_err;
+		}
+	}
+
+	if (!apf_armed && !cfg->wowl.any_filter_set) {
+		filter_buf.filter.id = cpu_to_le32(BRCMF_WOWL_ANY_FILTER_ID);
+		filter_buf.filter.type =
+			cpu_to_le32(BRCMF_PKT_FILTER_TYPE_PATTERN_MATCH);
+		filter_buf.filter.u.pattern.size_bytes = cpu_to_le32(1);
+		/* Match unicast Ethernet destinations (bit 0 of the first octet). */
+		filter_buf.filter.u.pattern.mask_and_pattern[0] = 0x01;
+		filter_buf.filter.u.pattern.mask_and_pattern[1] = 0x00;
+
+		err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add",
+					       filter_buf.data,
+					       sizeof(filter_buf.data));
+		if (err) {
+			bphy_err(cfg->pub, "failed to install wake-on-any packet filter: %d\n",
+				 err);
+			goto disable_apf;
+		}
+		cfg->wowl.any_filter_set = true;
+	}
+
+	/* Write the intended state whenever the filter exists, so a cycle
+	 * which could not disable it cannot leave it shadowing a program.
+	 */
+	if (cfg->wowl.any_filter_set) {
+		enable.enable = cpu_to_le32(!apf_armed);
+		err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &enable,
+					       sizeof(enable));
+		if (err) {
+			bphy_err(cfg->pub, "failed to %s wake-on-any packet filter: %d\n",
+				 apf_armed ? "disable" : "enable", err);
+			goto disable_apf;
+		}
+		cfg->wowl.any_filter_enabled = !apf_armed;
+	}
+
+	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
+				      BRCMF_PKT_FILTER_MODE_FORWARD_ON_MATCH);
+	if (err) {
+		bphy_err(cfg->pub, "failed to set wake-on-any packet filter mode: %d\n",
+			 err);
+		goto disable_filter;
+	}
+
+	err = brcmf_fil_cmd_int_get(ifp, BRCMF_C_GET_PM,
+				    &cfg->wowl.pre_pmmode);
+	if (err) {
+		bphy_err(cfg->pub, "failed to read power-save mode: %d\n", err);
+		goto disable_filter;
+	}
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
+	if (err) {
+		bphy_err(cfg->pub, "failed to enter maximum power save: %d\n",
+			 err);
+		goto disable_filter;
+	}
+	brcmf_configure_arp_nd_offload(ifp, true);
+	brcmf_bus_wowl_config(cfg->pub->bus_if, true);
+	cfg->wowl.active = true;
+	cfg->wowl.any = true;
+
+	return 0;
+
+disable_filter:
+	if (cfg->wowl.any_filter_enabled) {
+		enable.enable = cpu_to_le32(0);
+		if (!brcmf_fil_iovar_data_set(ifp, "pkt_filter_enable", &enable,
+					      sizeof(enable)))
+			cfg->wowl.any_filter_enabled = false;
+	}
+disable_apf:
+	apf_err = brcmf_apf_disable(ifp->vif);
+	if (apf_err)
+		bphy_err(cfg->pub, "failed to disable APF packet filter: %d\n",
+			 apf_err);
+	return err;
+}
+
 static int brcmf_keepalive_start(struct brcmf_if *ifp, unsigned int interval)
 {
 	struct brcmf_mkeep_alive_pkt_le kalive = {0};
@@ -4149,6 +4617,7 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 	struct net_device *ndev = cfg_to_ndev(cfg);
 	struct brcmf_if *ifp = netdev_priv(ndev);
 	struct brcmf_cfg80211_vif *vif;
+	int err;
 
 	brcmf_dbg(TRACE, "Enter\n");
 
@@ -4186,8 +4655,18 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 		brcmf_set_mpc(ifp, 1);
 
 	} else {
-		/* Configure WOWL parameters */
-		brcmf_configure_wowl(cfg, ifp, wowl);
+		if (wowl->any &&
+		    brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ANY)) {
+			err = brcmf_configure_wowl_any(cfg, ifp);
+			if (err)
+				return err;
+		} else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
+			/* Configure selective WOWL parameters. */
+			brcmf_configure_wowl(cfg, ifp, wowl);
+		} else {
+			brcmf_dbg(INFO, "refusing unsupported WoWLAN configuration\n");
+			return 1;
+		}
 
 		/* Prevent disassociation due to inactivity with keep-alive */
 		brcmf_keepalive_start(ifp, 30);
@@ -5990,6 +6469,7 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 	vif->wdev.wiphy = cfg->wiphy;
 	vif->wdev.iftype = type;
 	init_completion(&vif->mgmt_tx);
+	mutex_init(&vif->apf_mutex);
 
 	brcmf_init_prof(&vif->profile);
 
@@ -6012,6 +6492,12 @@ struct brcmf_cfg80211_vif *brcmf_alloc_vif(struct brcmf_cfg80211_info *cfg,
 void brcmf_free_vif(struct brcmf_cfg80211_vif *vif)
 {
 	list_del(&vif->list);
+	mutex_lock(&vif->apf_mutex);
+	brcmf_free_apf_program_locked(vif);
+	vif->apf_filter_installed = false;
+	vif->apf_filter_enabled = false;
+	mutex_unlock(&vif->apf_mutex);
+	mutex_destroy(&vif->apf_mutex);
 	kfree(vif);
 }
 
@@ -7823,11 +8309,13 @@ static const struct wiphy_wowlan_support brcmf_wowlan_support = {
 	.pattern_min_len = 1,
 	.max_pkt_offset = 1500,
 };
-#endif
+
+static const struct wiphy_wowlan_support brcmf_wowlan_any_support = {
+	.flags = WIPHY_WOWLAN_ANY,
+};
 
 static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
-#ifdef CONFIG_PM
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct wiphy_wowlan_support *wowl;
@@ -7853,8 +8341,8 @@ static void brcmf_wiphy_wowl_params(struct wiphy *wiphy, struct brcmf_if *ifp)
 	}
 
 	wiphy->wowlan = wowl;
-#endif
 }
+#endif
 
 static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 {
@@ -7946,10 +8434,14 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 	}
 	/* vendor commands/events support */
 	wiphy->vendor_commands = brcmf_vendor_cmds;
-	wiphy->n_vendor_commands = BRCMF_VNDR_CMDS_LAST - 1;
+	wiphy->n_vendor_commands = brcmf_vendor_cmds_count;
 
+#ifdef CONFIG_PM
 	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
+	else if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL_ANY))
+		wiphy->wowlan = &brcmf_wowlan_any_support;
+#endif
 	err = brcmf_fil_cmd_data_get(ifp, BRCMF_C_GET_BANDLIST, &bandlist,
 				     sizeof(bandlist));
 	if (err) {
@@ -8075,6 +8567,8 @@ static s32 brcmf_config_dongle(struct brcmf_cfg80211_info *cfg)
 		bphy_err(drvr, "failed to set frameburst mode\n");
 		goto default_conf_out;
 	}
+
+	brcmf_c_set_extra_iovars_up(ifp);
 
 	cfg->dongle_up = true;
 default_conf_out:
@@ -8567,7 +9061,8 @@ static void brcmf_free_wiphy(struct wiphy *wiphy)
 		kfree(wiphy->bands[NL80211_BAND_6GHZ]);
 	}
 #if IS_ENABLED(CONFIG_PM)
-	if (wiphy->wowlan != &brcmf_wowlan_support)
+	if (wiphy->wowlan != &brcmf_wowlan_support &&
+	    wiphy->wowlan != &brcmf_wowlan_any_support)
 		kfree(wiphy->wowlan);
 #endif
 }

@@ -231,10 +231,19 @@ static inline u32 get_comp_dsc_width(const struct exynos_dsc *dsc, u32 bpc)
 	})
 
 /* SFR read/write */
+/*
+ * An unmapped block reads as zero and swallows writes: on zuma the DP PHY
+ * block is not this driver's to touch. Guarded here rather than at the call
+ * sites so no dp_phy_* path can fault.
+ */
 static inline uint32_t cal_read(struct cal_regs_desc *regs_desc,
 				uint32_t offset)
 {
 	uint32_t val = 0;
+
+	if (!regs_desc->regs)
+		return 0;
+
 	val = readl(regs_desc->regs + offset);
 	return val;
 }
@@ -242,6 +251,9 @@ static inline uint32_t cal_read(struct cal_regs_desc *regs_desc,
 static inline void cal_write(struct cal_regs_desc *regs_desc, uint32_t offset,
 			     uint32_t val)
 {
+	if (!regs_desc->regs)
+		return;
+
 	writel(val, regs_desc->regs + offset);
 }
 
@@ -342,7 +354,12 @@ static inline void cal_dump_regs(struct cal_regs_desc *desc)
 
 
 #define MAX_DP_CNT 2
-#define MAX_SST_CNT 4
+/*
+ * SSTs are 0x1000 apart from SST1_* at 0x5000, and the link mapping is
+ * 0x6000 long: anything past SST1 faults. The vendor CAL maps each SST
+ * separately and only ever brings up SST1 here.
+ */
+#define MAX_SST_CNT 1
 #define MAX_VC_PAYLOAD_TIMESLOT 63
 #define NUM_VC_PAYLOAD_SLOT 8
 
@@ -564,6 +581,10 @@ void dp_reg_phy_disable(u32 id);
 void dp_reg_set_lane_count(u32 id, u8 lane_cnt);
 u32 dp_reg_get_lane_count(u32 id);
 void dp_reg_set_enhanced_mode(u32 id, u32 en);
+void dp_reg_set_txclk(u32 id, bool from_phy);
+u32 dp_reg_get_gfmux_status(u32 id);
+void dp_reg_set_snps_tx_clk(u32 id, u8 lane_cnt);
+void dp_reg_set_snps_tx_data_en(u32 id, u8 lane_cnt);
 void dp_reg_set_training_pattern(u32 id, dp_training_pattern pattern);
 void dp_reg_scrambling_enable(u32 id, bool status);
 void dp_reg_set_voltage_and_pre_emphasis(u32 id, u8 *voltage, u8 *pre_emphasis);
@@ -644,6 +665,10 @@ typedef enum exynos_dp_debug_lt {
 	DEBUG_LT_BW_NO_STEPDOWN,
 } dp_debug_lt;
 
+#define INFOFRAME_PACKET_TYPE_SPD	0x83
+#define SPD_INFOFRAME_LENGTH		25
+#define MAX_INFOFRAME_LENGTH		27
+
 struct exynos_dp_video_info {
 	struct videomode vm;	/* clock & resolution & porch */
 	bool hsync_pol;		/* polarity */
@@ -653,6 +678,10 @@ struct exynos_dp_video_info {
 
 	u32 sst_id;	/* dp_sst_idx_t - 1 */
 	enum dynamic_range_type dyn_range;
+
+	/* AVI InfoFrame data bytes, packed at mode set, sent at stream enable */
+	u8 avi_data[MAX_INFOFRAME_LENGTH];
+	u8 avi_len;
 
 	/* DSC */
 	struct {
@@ -694,8 +723,6 @@ struct exynos_dp_subdev {
 
 	u32 id;
 	int irq;
-	struct gpio_desc *hpd_gpio;
-	int hpd_gpio_irq;
 
 	struct phy *phy;
 	spinlock_t slock;
@@ -711,7 +738,15 @@ struct exynos_dp_subdev {
 	struct exynos_dp_lt_info lt_info;
 
 	int hpd_state;
+	/*
+	 * What the Type-C side last told us. This, not SYSTEM_HPD_CONTROL, is
+	 * the authority on whether a sink is attached: there is no HPD wire on
+	 * USB-C, and the register only reads back what we force into it.
+	 */
+	bool oob_plugged;
 	bool training_state;
+	/* DPOSC rate in MHz, for the OSC clock dividers */
+	u32 osc_mhz;
 	u32 bist_use;
 	enum test_pattern bist_type;
 	struct exynos_dp_video_info vi[DP_SST_MAX];
@@ -801,6 +836,9 @@ struct exynos_drm_dp {
 
 	/* vmst */
 	struct drm_bridge		bridge;
+	/* Held at probe, enabled at bring-up: ungating earlier resets the SoC. */
+	struct clk			*dposc;
+	struct clk			*pclk;
 	struct drm_remote		remote[DP_SST_MAX];
 };
 
@@ -818,12 +856,10 @@ void exynos_drm_dp_dpcd_status_dump(struct exynos_dp_subdev *dp);
 
 uint32_t exynos_drm_dp_find_possible_crtc(struct exynos_drm_dp *dp, int sst_idx);
 dp_sst_idx_t exynos_drm_dp_get_sst_idx(struct drm_encoder *encoder);
-int exynos_drm_dp_add_timings(struct exynos_drm_dp *dp,
-			struct drm_connector *connector);
 struct drm_connector *exynos_drm_dp_find_connector
 				(struct drm_encoder *encoder);
 void exynos_drm_dp_to_videoinfo(struct drm_encoder *encoder,
-		struct drm_display_mode *mode,
+		const struct drm_display_mode *mode,
 		struct exynos_dp_video_info *vi);
 bool exynos_drm_dp_dsc_enable(struct drm_encoder *encoder,
 		struct exynos_dp_video_info *vi,
@@ -870,18 +906,13 @@ static inline dp_sst_idx_t exynos_drm_dp_get_sst_idx(struct drm_encoder *encoder
 {
 	return DP_SST_UNKNOWN;
 }
-static inline int exynos_drm_dp_add_timings(struct exynos_drm_dp *dp,
-			struct drm_connector *connector)
-{
-	return 0;
-}
 static inline struct drm_connector *exynos_drm_dp_find_connector
 				(struct drm_encoder *encoder)
 {
 	return NULL;
 }
 static inline void exynos_drm_dp_to_videoinfo(struct drm_encoder *encoder,
-		struct drm_display_mode *mode,
+		const struct drm_display_mode *mode,
 		struct exynos_dp_video_info *vi)
 {
 }

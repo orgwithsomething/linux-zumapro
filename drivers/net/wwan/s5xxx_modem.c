@@ -30,6 +30,7 @@
  */
 
 #include <linux/completion.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/gpio/consumer.h>
@@ -50,6 +51,7 @@
 #include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/skbuff.h>
+#include <linux/timekeeping.h>
 #include <linux/slab.h>
 #include <linux/sprintf.h>
 #include <linux/unaligned.h>
@@ -238,10 +240,35 @@ struct s5xxx_variant {
  * id would be 1.  Keep ap_cap bit1 set or this must change.
  */
 #define S5XXX_CH_PDP_FIRST		0xb5
+/*
+ * The CP keys PS data on a channel per PDP context, EXYNOS_CH_EX_ID_PDP_0 (181)
+ * through +29 (210), one raw-IP interface each: a context's channel is what
+ * picks its interface, and a modem stack selects the interface for a context by
+ * name.  So the netdevs are keyed on the channel rather than on the pktproc DL
+ * queue that happened to carry the packet -- any queue can deliver any channel,
+ * and a second APN lands on a channel no queue index would have reached.
+ */
+#define S5XXX_PDP_CH_COUNT		30
+#define S5XXX_PDP_CH_LAST		(S5XXX_CH_PDP_FIRST + S5XXX_PDP_CH_COUNT - 1)
 #define S5XXX_IPC_AP2CP_MSG		0x800
 #define S5XXX_IPC_CP2AP_MSG		0x804
 #define S5XXX_IPC_AP2CP_STATUS		0x808
+/*
+ * The AP's monotonic clock, which the CP reads to align its own log timestamps
+ * with the AP's.  Downstream publishes it immediately before each
+ * AP2CP_PDA_ACTIVE transition: seconds within the hour in the upper 12 bits,
+ * microseconds in the lower 20.
+ */
+#define S5XXX_IPC_AP2CP_KERNELTIME	0x824
+#define S5XXX_KERNELTIME_SEC_SHIFT	20
 #define S5XXX_IPC_CP2AP_STATUS		0x80c
+/*
+ * The one runtime payload of cp2ap_status (downstream shmem_tx_state_handler):
+ * the CP asks the AP to stop feeding it uplink while its ingress quiesces, and
+ * to resume afterwards.  Only the PKTPROC UL path is gated -- the legacy
+ * FMT/RAW rings are CP-paced and stay open.
+ */
+#define S5XXX_CP2AP_FLOWCTL		BIT(2)
 /*
  * Handover block (downstream ap2cp_handover_block_info = <0x02 0x82c>): a
  * 161-byte struct t_handover_block_info the AP stages before BL1, carrying the
@@ -306,6 +333,7 @@ struct s5xxx_variant {
 #define S5XXX_IPC_DS_DET		(1u << 14)		/* 0x4000 */
 
 #define S5XXX_IPC_SRINFO_OFFSET		0x400000
+#define S5XXX_IPC_SRINFO_SIZE		0x300000
 #define S5XXX_IPC_MAGIC_VALUE		0xaa	/* SIT protocol magic */
 
 /* Interrupt-word encoding (downstream link_device_memory.h). */
@@ -339,6 +367,14 @@ struct s5xxx_variant {
  * AT (21, EXYNOS_CH_ID_BT_DUN) = umts_router AT commands on the NORM_RAW ring.
  */
 #define S5XXX_CH_FMT			245
+/*
+ * The CP runs two logical SIT control channels over that ring, umts_ipc0 (245)
+ * and umts_ipc1 (246), and a RIL opens both: the second carries the requests
+ * the first is busy blocking on, so a stack that only finds wwan0sit0 stalls
+ * partway through modem init.  They are consecutive from S5XXX_CH_FMT, so the
+ * ports come up in channel order as wwan0sit0 and wwan0sit1.
+ */
+#define S5XXX_SIT_PORTS			2
 #define S5XXX_CH_AT			21
 /*
  * RFS file channel (EXYNOS_CH_ID_RFS_0, umts_rfs0) on the NORM_RAW ring: once
@@ -440,12 +476,49 @@ struct s5xxx_variant {
 #define S5XXX_CH_OEM			0x82	/* EXYNOS_CH_ID_OEM_0 + 1 (oem_ipc1) */
 
 /*
+ * The CP's two other OEM channels, same transport and frame shape, different
+ * owners downstream: oem_ipc0 (0x81) is the vendor.google.radioext HAL's
+ * RF-coexistence indications, oem_ipc3 (0x84) is shared_modem_platform's GEMS
+ * "GIPC" services (the CP's own temperature sensors and modem statistics).
+ * 0x84 carries requests -- downstream acks each one, and here two of them at
+ * ONLINE+2.66s go unanswered and the CP asserts 1.28s later, every boot.
+ */
+#define S5XXX_CH_OEM0			0x81
+#define S5XXX_CH_OEM3			0x84
+#define S5XXX_OEM_PORTS			3
+
+/*
  * The GNSS receiver is booted by the CP, not by us: once its firmware is in
  * the shared window (see S5XXX_GNSS_FW), the CP starts it in response to this
  * RAW channel -- the vendor's gnss_boot io_device.  Plain passthrough, so the
  * channel is exposed as a port and the boot conversation is left to user space.
  */
+/*
+ * Consecutive failed relinks before the CP is declared dead.  Ten is what
+ * downstream allows before forcing a CP crash, and each relink already makes
+ * its own training attempts.  Reaching it stops further relinks until something
+ * resets the CP, which is what clears the count -- unlike downstream, nothing
+ * here clears sm->online on a crash, so the count is what has to hold the
+ * storm off.
+ */
+#define S5XXX_RELINK_FAIL_LIMIT		10
+
 #define S5XXX_CH_GNSS_BOOT		0xf0
+/*
+ * The receiver's second channel.  Downstream calls it gnss_dump and it does
+ * carry the receiver's account of itself -- OSP-encoded diagnostics with
+ * embedded text: calibration tables, state transitions, the configuration it
+ * believes it was given, about 1.6 MB of it across a stock boot.  But it is not
+ * only a log: the aiding goes up it too, as encrypted SGEE blobs, so it is
+ * bidirectional and belongs to the receiver's normal operation rather than to
+ * debugging.  Frames are BETP, same as the boot channel.
+ *
+ * Exposed as a second WWAN_PORT_GNSS port, so it names as gnss1 beside the
+ * boot channel's gnss0, rather than as a port type of its own: the type already
+ * means "a CP link channel to the GNSS receiver", which is what both are.
+ */
+#define S5XXX_CH_GNSS_DUMP		0xef
+#define S5XXX_GNSS_DUMP_MAX		SZ_4K
 #define S5XXX_FMT_MAX			(S5XXX_FMT_TXQ_SIZE - S5XXX_SIT_HDR - 8)
 #define S5XXX_SIT_CH_BOOT		0xf1		/* EXYNOS_CH_ID_BOOT */
 #define S5XXX_DL_HDR			12
@@ -473,6 +546,26 @@ struct s5xxx_rfs_file {
 };
 
 struct s5xxx_modem;
+
+/*
+ * One SIT control port.  Same shape as the OEM channels below and for the same
+ * reason -- the port ops need to know which channel they are speaking on, and
+ * the link-header sequence is counted per channel, not per ring.
+ */
+struct s5xxx_sit_ch {
+	struct s5xxx_modem	*sm;
+	struct wwan_port	*port;
+	u8			ch;
+	u8			ch_seq;		/* per-channel link-header seq */
+};
+
+/* One OEM char port: the port ops need the channel, not just the modem. */
+struct s5xxx_oem_ch {
+	struct s5xxx_modem	*sm;
+	struct wwan_port	*port;
+	u8			ch;
+	u8			ch_seq;		/* per-channel link-header seq */
+};
 
 struct s5xxx_modem {
 	const struct s5xxx_variant *var;
@@ -519,6 +612,8 @@ struct s5xxx_modem {
 	struct mutex		pcie_onoff_lock; /* serialises relink up/down */
 	bool			pm_armed;	/* cp2ap_irq enabled (boot-seq guard) */
 	bool			link_up;	/* RC link powered on (sm->lock) */
+	bool			resume_recheck;	/* reconcile an RC-forced park (sm->lock) */
+	unsigned int		relink_failures; /* consecutive failed relinks (pm_work only) */
 	bool			db_reserved;	/* doorbell deferred to wake (sm->lock) */
 	bool			cp_wants_up;	/* CP2AP_WAKEUP level latched at edge */
 	bool			main_armed;	/* MAIN took a link-up ISR (services rings) */
@@ -529,22 +624,21 @@ struct s5xxx_modem {
 	u8			at_ch_seq;	/* per-channel header sequence */
 
 	/*
-	 * SIT control plane on the FMT ring (umts_ipc0, ch 0xF5).  The CP gates
-	 * its secondary channels on this being serviced + acked; exposed as its
-	 * own port so a userspace RIL can drive the modem init handshake.
+	 * SIT control plane on the FMT ring (umts_ipc0/1, ch 245/246).  The CP
+	 * gates its secondary channels on this being serviced + acked; exposed as
+	 * ports so a userspace RIL can drive the modem init handshake.
 	 */
-	struct wwan_port	*ctrl_port;
+	struct s5xxx_sit_ch	sit[S5XXX_SIT_PORTS];
 	u16			fmt_frame_seq;	/* FMT SIT frame counter */
-	u8			fmt_ch_seq;	/* FMT per-channel sequence */
 
 	/*
-	 * OEM/GEMS channel (ch 0x82) on the FMT ring, a WWAN_PORT_OEM char port.
-	 * Both post-ONLINE FMT writers (SIT + oem) share tx_lock and fmt_frame_seq
-	 * via s5xxx_fmt_ring_tx(); fmt_tx_wq wakes a blocked oem writer when the CP
-	 * drains the txq and frees ring space.
+	 * The three OEM/GEMS channels (0x81/0x82/0x84) on the FMT ring, one
+	 * WWAN_PORT_OEM char port each.  All post-ONLINE FMT writers (SIT + oem)
+	 * share tx_lock and fmt_frame_seq via s5xxx_fmt_ring_tx(); fmt_tx_wq wakes
+	 * a blocked oem writer when the CP drains the txq and frees ring space.
 	 */
-	struct wwan_port	*oem_port;
-	u8			oem_ch_seq;	/* per-channel link-header seq */
+	struct s5xxx_oem_ch	oem[S5XXX_OEM_PORTS];
+	struct dentry		*dbgfs;		/* dump-boot trigger */
 	wait_queue_head_t	fmt_tx_wq;
 	unsigned long		fmt_busy_until;	/* inhibit park during an FMT transfer (jiffies) */
 
@@ -559,6 +653,8 @@ struct s5xxx_modem {
 	 */
 	struct wwan_port	*gnss_port;
 	u8			gnss_ch_seq;	/* GNSS per-channel sequence */
+	struct wwan_port	*gnss_dump_port;
+	u8			gnss_dump_ch_seq;
 	/*
 	 * The in-kernel codeload (s5xxx_gnss_codeload) runs before gnss_port
 	 * exists and collects the CP's ch-0xf0 replies here; once the port is up
@@ -577,19 +673,24 @@ struct s5xxx_modem {
 	u8			*rfs_txbuf;	/* one READ frame (rfs_work only) */
 
 	/*
-	 * PKTPROC data path: the raw-IP data netdev (rmnet0).  The DL sktbuf ring
-	 * is drained from the MSI handler into skbs; dl_fore is the AP's re-arm
-	 * (buffers-available) pointer and dl_done its private consumer cursor, both
-	 * per DL queue.  The UL NORM ring is fed by ndo_start_xmit; ul_done is the
-	 * producer index, touched only under tx_lock.
+	 * PKTPROC data path: the raw-IP data netdevs (rmnet0..).  DL queue q is
+	 * drained from the MSI handler and delivered to the netdev owning the lcid
+	 * the CP tagged the descriptor with -- the queue is transport, not
+	 * identity.  dl_fore is the AP's re-arm (buffers-available) pointer and
+	 * dl_done its private consumer cursor, both per DL queue.  The UL NORM ring
+	 * is fed by ndo_start_xmit on any interface, tagged with that interface's
+	 * own channel; ul_done is the producer index, touched only under tx_lock.
 	 */
-	struct net_device	*ndev;
+	struct net_device	*ndev[S5XXX_PDP_CH_COUNT];
+	bool			pdp_up;		/* netdevs registered (release/acquire) */
 	u32			dl_fore[S5XXX_PKTPROC_DL_NUM_QUEUE];
 	u32			dl_done[S5XXX_PKTPROC_DL_NUM_QUEUE];
 	u32			ul_done;
 	u16			ul_cp_quota;
 	u8			ul_end_bit_owner;
 	bool			ul_active;
+	bool			tx_suspended;	/* CP TX flow control (cp2ap_status) */
+	int			nvec;		/* MSI vectors actually allocated */
 };
 
 /*
@@ -608,6 +709,42 @@ static const char *s5xxx_fw_path(struct s5xxx_modem *sm, char *buf,
 }
 
 /*
+ * Where the AOC expects to find the CP.
+ *
+ * The AOC's SysMMU table is baked into aoc.bin and maps two 512K windows at
+ * *CPU* addresses 0x40000000 and 0x40400000.  Those are inside pcie_0's
+ * outbound window, which this SoC's DT translates
+ *
+ *	CPU 0x40000000 + n  <->  PCI 0x14e00000 + n	(size 0xff0000)
+ *
+ * so the CP's BARs -- which hold PCI bus addresses, not CPU ones -- have to be
+ * placed at the translated addresses.  Taking the layout the PCI core assigns
+ * on a stock device and converting it:
+ *
+ *	BAR2  1M   CPU 0x40000000  ->  PCI 0x14e00000   CP memory; the AOC
+ *	                                                reads CallInfo here
+ *	BAR3  1M   CPU 0x40100000  ->  PCI 0x14f00000
+ *	BAR4  1M   CPU 0x40200000  ->  PCI 0x15000000
+ *	BAR5  1M   CPU 0x40300000  ->  PCI 0x15100000
+ *	BAR0  64K  CPU 0x40400000  ->  PCI 0x15200000   the doorbell page
+ *
+ * We used to put BAR0 at PCI 0x14e60000 -- inside what should be BAR2's window
+ * -- and leave every other BAR unassigned.  That is enough for the AP, which
+ * only rings the doorbell and DMAs through DRAM, but it leaves both of the
+ * AOC's windows decoding to nothing: every read it makes of them returns
+ * all-ones.  Hence a call that connects, carries RTP and clocks voice frames
+ * while the AOC logs "PCIe Modem Configuration: Unknown codec type
+ * (0xffffffff)" for its whole duration with the speaker silent.
+ *
+ * Only BAR0 and BAR2 are programmed; BAR3-5 are not mapped by the AOC and
+ * nothing on the AP reaches them.
+ */
+#define S5XXX_CP_BAR0_BUS	0x15200000u	/* AOC sees CPU 0x40400000 */
+#define S5XXX_CP_BAR2_BUS	0x14e00000u	/* AOC sees CPU 0x40000000 */
+#define S5XXX_CP_WIN_BASE	0x14e00000u
+#define S5XXX_CP_WIN_LIMIT	0x152fffffu
+
+/*
  * Program the doorbell BAR and read it back, like downstream does (it
  * computes the doorbell offset from what actually landed, and its restore
  * path runs a "BAR0 value correction" rewrite).  The ROM-phase BAR is 1M
@@ -621,23 +758,49 @@ static int s5xxx_program_doorbell_bar(struct s5xxx_modem *sm)
 
 	for (try = 0; try < 10; try++) {
 		pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_0,
-				       sm->db_bus_addr);
+				       S5XXX_CP_BAR0_BUS);
 		pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_1, 0);
 		pci_read_config_dword(sm->pdev, PCI_BASE_ADDRESS_0, &val);
 		base = val & PCI_BASE_ADDRESS_MEM_MASK;
-		if (base && base <= sm->db_bus_addr &&
-		    sm->db_bus_addr - base < SZ_1M) {
+		if (base && base <= S5XXX_CP_BAR0_BUS &&
+		    S5XXX_CP_BAR0_BUS - base < SZ_1M) {
 			if (try)
 				dev_warn(sm->dev,
 					 "doorbell BAR stuck after %d retries (%#x)\n",
 					 try, val);
+			/*
+			 * The doorbell sits at the base of this BAR, so it
+			 * moves with it; the DT address named the same page
+			 * in the CP's own space.
+			 */
+			if (sm->db_bus_addr != base) {
+				dev_info(sm->dev,
+					 "doorbell bus address %#x -> %#x (AOC-visible BAR layout)\n",
+					 sm->db_bus_addr, base);
+				sm->db_bus_addr = base;
+			}
+
+			/*
+			 * BAR2 is the window the AOC reads CallInfo through.
+			 * Nothing on the AP touches it, so it is write-only
+			 * housekeeping -- but without it the AOC is blind.
+			 */
+			pci_write_config_dword(sm->pdev, PCI_BASE_ADDRESS_2,
+					       S5XXX_CP_BAR2_BUS);
+			pci_read_config_dword(sm->pdev, PCI_BASE_ADDRESS_2,
+					      &val);
+			if ((val & PCI_BASE_ADDRESS_MEM_MASK) !=
+			    S5XXX_CP_BAR2_BUS)
+				dev_warn(sm->dev,
+					 "CP BAR2 won't hold %#x (reads %#010x); the AOC will not see the CP\n",
+					 S5XXX_CP_BAR2_BUS, val);
 			return 0;
 		}
 		udelay(100);
 	}
 
 	dev_err(sm->dev, "doorbell BAR won't hold %#x (reads %#x)\n",
-		sm->db_bus_addr, val);
+		S5XXX_CP_BAR0_BUS, val);
 	return -EIO;
 }
 
@@ -655,8 +818,8 @@ static int s5xxx_program_doorbell_bar(struct s5xxx_modem *sm)
 static int s5xxx_open_bridge_window(struct s5xxx_modem *sm)
 {
 	struct pci_dev *bridge = pci_upstream_bridge(sm->pdev);
-	u32 base = sm->db_bus_addr & ~(SZ_1M - 1);
-	u32 limit = base + SZ_1M - 1;
+	u32 base = S5XXX_CP_WIN_BASE;
+	u32 limit = S5XXX_CP_WIN_LIMIT;
 	u32 want = (((limit >> 16) & 0xfff0) << 16) | ((base >> 16) & 0xfff0);
 	u32 val;
 	u16 cmd;
@@ -666,9 +829,9 @@ static int s5xxx_open_bridge_window(struct s5xxx_modem *sm)
 
 	pci_read_config_dword(bridge, PCI_MEMORY_BASE, &val);
 	if (val != want) {
-		dev_info(sm->dev,
-			 "opening root-port memory window %#x-%#x (was %#010x)\n",
-			 base, limit, val);
+		dev_dbg(sm->dev,
+			"opening root-port memory window %#x-%#x (was %#010x)\n",
+			base, limit, val);
 		pci_write_config_dword(bridge, PCI_MEMORY_BASE, want);
 		pci_read_config_dword(bridge, PCI_MEMORY_BASE, &val);
 		if (val != want) {
@@ -764,7 +927,18 @@ static void s5xxx_verify_msi_target(struct s5xxx_modem *sm)
 		pci_restore_msi_state(sm->pdev);
 	}
 
-	dev_err(sm->dev, "MSI address won't hold %pap\n", &sm->msi_phys);
+	/*
+	 * Say which of the two it is, because they read identically here and
+	 * point opposite ways.  Outside D0, or with MSI disabled, the core never
+	 * issued the write at all -- __pci_write_msi_msg() skips the hardware
+	 * for any non-D0 state -- so the endpoint is innocent and the fault is
+	 * on this side.  In D0 with MSI enabled the write was issued and
+	 * dropped, which is the half-alive ROM a warm reset of a running CP
+	 * leaves behind.
+	 */
+	dev_err(sm->dev, "MSI address won't hold %pap (endpoint %s, msi %s)\n",
+		&sm->msi_phys, pci_power_name(sm->pdev->current_state),
+		sm->pdev->msi_enabled ? "enabled" : "disabled");
 }
 
 /*
@@ -877,6 +1051,49 @@ static bool s5xxx_tx_pending(struct s5xxx_modem *sm)
 }
 
 /*
+ * Stop or wake the data interfaces' queues.  Only the netdevs are gated: the
+ * legacy rings are CP-paced, so the control planes stay open while uplink is
+ * held.  netif_stop_queue()/netif_wake_queue() are idempotent.
+ */
+static void s5xxx_pdp_flowctl(struct s5xxx_modem *sm, bool suspend)
+{
+	int i;
+
+	for (i = 0; i < S5XXX_PDP_CH_COUNT; i++) {
+		/* Snapshot: s5xxx_online() publishes these from process context. */
+		struct net_device *ndev = READ_ONCE(sm->ndev[i]);
+
+		if (!ndev)
+			continue;
+		if (suspend)
+			netif_stop_queue(ndev);
+		else
+			netif_wake_queue(ndev);
+	}
+}
+
+/*
+ * MSI vector 1: the CP's cp2ap_status interrupt.  It carries the global TX
+ * flow-control bit; the CP raises it to quiesce its ingress and clears it to
+ * resume.  Edge-triggered against our own view so a repeated status write does
+ * not churn every queue.
+ */
+static irqreturn_t s5xxx_tx_state_irq(int irq, void *data)
+{
+	struct s5xxx_modem *sm = data;
+	u32 status = readl(sm->ipc + S5XXX_IPC_CP2AP_STATUS);
+	bool suspend = status & S5XXX_CP2AP_FLOWCTL;
+
+	if (suspend == READ_ONCE(sm->tx_suspended))
+		return IRQ_HANDLED;
+
+	WRITE_ONCE(sm->tx_suspended, suspend);
+	s5xxx_pdp_flowctl(sm, suspend);
+
+	return IRQ_HANDLED;
+}
+
+/*
  * Reconcile the RC link power with what the CP asks for on CP2AP_WAKEUP,
  * mirroring downstream s5100_poweron_pcie()/s5100_poweroff_pcie() driven from
  * ap_wakeup_handler().  Runs on an ordered workqueue because the relink sleeps
@@ -890,6 +1107,7 @@ static void s5xxx_pm_work(struct work_struct *work)
 	struct s5xxx_modem *sm = container_of(work, struct s5xxx_modem, pm_work);
 	bool want_up = READ_ONCE(sm->cp_wants_up);
 	unsigned long flags;
+	bool recheck;
 
 	/*
 	 * Relink ONLY when the CP is actually asking for the link (CP2AP_WAKEUP
@@ -903,7 +1121,29 @@ static void s5xxx_pm_work(struct work_struct *work)
 	 */
 	mutex_lock(&sm->pcie_onoff_lock);
 
+	/*
+	 * First run after a system resume.  The root complex's suspend path may
+	 * have parked a link the runtime worker had deferred parking, and it
+	 * suppresses the link-down callback for that deliberate teardown -- so
+	 * our cached link_up can be stale-true.  Reconcile against the hardware
+	 * before deciding whether the CP's wake request needs a relink; without
+	 * this the request is treated as already satisfied and never trains.
+	 */
+	spin_lock_irqsave(&sm->lock, flags);
+	recheck = sm->resume_recheck;
+	sm->resume_recheck = false;
+	spin_unlock_irqrestore(&sm->lock, flags);
+
+	if (recheck && sm->link_up &&
+	    !zumapro_pcie_modem_link_active(sm->rc_dev)) {
+		spin_lock_irqsave(&sm->lock, flags);
+		sm->link_up = false;
+		spin_unlock_irqrestore(&sm->lock, flags);
+		dev_dbg(sm->dev, "system resume: link was parked by the RC\n");
+	}
+
 	if (want_up && !sm->link_up &&
+	    sm->relink_failures < S5XXX_RELINK_FAIL_LIMIT &&
 	    gpiod_get_value_cansleep(sm->cp2ap_wakeup)) {
 		if (zumapro_pcie_modem_link_up(sm->rc_dev) == 0) {
 			s5xxx_relink_restore(sm);
@@ -916,9 +1156,32 @@ static void s5xxx_pm_work(struct work_struct *work)
 			 */
 			sm->main_armed = true;
 			spin_unlock_irqrestore(&sm->lock, flags);
-			dev_info(sm->dev, "CP wakeup: link up (MAIN armed)\n");
+			sm->relink_failures = 0;
+			dev_dbg(sm->dev, "CP wakeup: link up (MAIN armed)\n");
 		} else {
-			dev_err(sm->dev, "CP wakeup: relink failed\n");
+			/*
+			 * A CP can stay alive -- CP_ACTIVE and PS_HOLD high --
+			 * and still stop answering AP2CP_WAKEUP and link
+			 * training.  The crash IRQ never fires, so without a
+			 * budget here every transmit queues another relink that
+			 * fails identically, for as long as anything transmits,
+			 * and the modem stays unusable until a reboot.
+			 *
+			 * Ten is what downstream allows before forcing a CP
+			 * crash, and each relink already makes its own training
+			 * attempts.  Past that, hand the CP to the recovery path
+			 * the way the crash IRQ does: userspace sees it leave
+			 * ONLINE and resets it, and the cleared flag stops
+			 * further relinks from here.
+			 */
+			if (++sm->relink_failures < S5XXX_RELINK_FAIL_LIMIT) {
+				dev_err(sm->dev, "CP wakeup: relink failed\n");
+			} else {
+				dev_err(sm->dev,
+					"relink failed %u times, taking the CP offline\n",
+					sm->relink_failures);
+				WRITE_ONCE(sm->online, false);
+			}
 		}
 	} else if (!want_up && sm->link_up) {
 		bool park;
@@ -966,7 +1229,7 @@ static void s5xxx_pm_work(struct work_struct *work)
 
 			if (park) {
 				zumapro_pcie_modem_link_down(sm->rc_dev);
-				dev_info(sm->dev, "CP sleep: link down (parked)\n");
+				dev_dbg(sm->dev, "CP sleep: link down (parked)\n");
 			}
 		}
 	}
@@ -1007,7 +1270,7 @@ static irqreturn_t s5xxx_cp2ap_wakeup_irq(int irq, void *data)
 	int up = gpiod_get_value(sm->cp2ap_wakeup);
 
 	WRITE_ONCE(sm->cp_wants_up, up);
-	dev_info(sm->dev, "CP2AP_WAKEUP irq: level %d\n", up);
+	dev_dbg(sm->dev, "CP2AP_WAKEUP irq: level %d\n", up);
 	queue_work(sm->pm_wq, &sm->pm_work);
 	return IRQ_HANDLED;
 }
@@ -1176,6 +1439,24 @@ static int s5xxx_build_handover(struct s5xxx_modem *sm, u8 *buf)
 	return 0;
 }
 
+static bool ds_det = true;
+module_param(ds_det, bool, 0444);
+MODULE_PARM_DESC(ds_det,
+		 "let the CP idle-park the PCIe link post-ONLINE (0 pins it at L0)");
+
+static void s5xxx_publish_kernel_time(struct s5xxx_modem *sm)
+{
+	struct timespec64 ts;
+	u32 seconds, useconds;
+
+	ktime_get_ts64(&ts);
+	seconds = ts.tv_sec % 3600;
+	useconds = ts.tv_nsec / NSEC_PER_USEC;
+	writel((seconds << S5XXX_KERNELTIME_SEC_SHIFT) | useconds,
+	       sm->ipc + S5XXX_IPC_AP2CP_KERNELTIME);
+	dev_dbg(sm->dev, "AP2CP kernel time %u.%06u\n", seconds, useconds);
+}
+
 static void s5xxx_init_control_messages(struct s5xxx_modem *sm)
 {
 	const struct firmware *fw;
@@ -1195,8 +1476,10 @@ static void s5xxx_init_control_messages(struct s5xxx_modem *sm)
 	/*
 	 * ds_det=1 (0x4000) tells the CP to run its deep-sleep link PM: park the
 	 * link when idle and ask for it back on CP2AP_WAKEUP (s5xxx_pm_work).
+	 * ds_det=0 keeps the link pinned at L0 -- diagnostic for the post-ONLINE
+	 * crash, and not what stock does (stock ap2cp_united reads 0x4000).
 	 */
-	writel(S5XXX_IPC_DS_DET, sm->ipc + S5XXX_IPC_AP2CP_STATUS);
+	writel(ds_det ? S5XXX_IPC_DS_DET : 0, sm->ipc + S5XXX_IPC_AP2CP_STATUS);
 	writel(0, sm->ipc + S5XXX_IPC_CP2AP_STATUS);
 	for (i = 0; i < S5XXX_IPC_CAP_WORDS; i++)
 		writel(0, sm->ipc + S5XXX_IPC_CAP_BASE + 4 * i);
@@ -1418,10 +1701,19 @@ static void s5xxx_init_ipc_queues(struct s5xxx_modem *sm)
 	u32 magic, access;
 	int i;
 
+	/*
+	 * A rebooted CP starts un-flow-controlled; clear any stop the previous
+	 * incarnation left behind so the surviving netdevs are not held down.
+	 */
+	WRITE_ONCE(sm->tx_suspended, false);
+	s5xxx_pdp_flowctl(sm, false);
+
 	sm->fmt_frame_seq = 0;
-	sm->fmt_ch_seq = 0;
+	for (i = 0; i < S5XXX_SIT_PORTS; i++)
+		sm->sit[i].ch_seq = 0;
 	sm->at_ch_seq = 0;
 	sm->rfs_ch_seq = 0;
+	sm->gnss_dump_ch_seq = 0;
 
 	writel(0, sm->ipc + S5XXX_IPC_MAGIC);
 	writel(0, sm->ipc + S5XXX_IPC_ACCESS);
@@ -1528,6 +1820,9 @@ static int s5xxx_ring_tx(struct s5xxx_modem *sm, const struct s5xxx_txring *r,
 	}
 	if (s5xxx_circ_space(r->size, in, out) < flen) {
 		spin_unlock_irqrestore(&sm->tx_lock, flags);
+		dev_info_ratelimited(sm->dev,
+			     "txq full: ch %#x len %u in %#x out %#x space %u\n",
+			     ch, len, in, out, s5xxx_circ_space(r->size, in, out));
 		return full_err;
 	}
 
@@ -1698,7 +1993,9 @@ static void s5xxx_gnss_codeload(struct s5xxx_modem *sm, u32 fw_size, u32 hdr4)
 /*
  * gnss_boot char port (RAW ch 0xf0).  After the in-kernel codeload has started
  * the receiver, this exposes the channel raw so user space can drive the
- * runtime side (SGEE aiding); the CP's replies arrive as port reads.
+ * runtime side; the CP's replies arrive as port reads.  The aiding upload is
+ * not here -- it goes up the dump channel (gnss1) -- but the session control
+ * the receiver expects after boot is.
  */
 static int s5xxx_gnss_tx(struct wwan_port *port, struct sk_buff *skb)
 {
@@ -1720,6 +2017,30 @@ static const struct wwan_port_ops s5xxx_gnss_ops = {
 	.start	= s5xxx_wwan_start,
 	.stop	= s5xxx_wwan_stop,
 	.tx	= s5xxx_gnss_tx,
+};
+
+/* The dump channel's uplink: the encrypted SGEE aiding the receiver asks for. */
+static int s5xxx_gnss_dump_tx(struct wwan_port *port, struct sk_buff *skb)
+{
+	struct s5xxx_modem *sm = wwan_port_get_drvdata(port);
+	int ret;
+
+	if (!sm->online)
+		return -ENODEV;
+	ret = s5xxx_ring_tx(sm, &s5xxx_raw_txring, &sm->frame_seq,
+			    S5XXX_CH_GNSS_DUMP, &sm->gnss_dump_ch_seq,
+			    S5XXX_GNSS_DUMP_MAX - S5XXX_SIT_HDR,
+			    skb->data, skb->len, -EAGAIN);
+	if (ret)
+		return ret;
+	consume_skb(skb);
+	return 0;
+}
+
+static const struct wwan_port_ops s5xxx_gnss_dump_ops = {
+	.start	= s5xxx_wwan_start,
+	.stop	= s5xxx_wwan_stop,
+	.tx	= s5xxx_gnss_dump_tx,
 };
 
 /* Free space (bytes) in the FMT txq; 0 if the CP left the pointers corrupt. */
@@ -1757,11 +2078,31 @@ static int s5xxx_fmt_ring_tx(struct s5xxx_modem *sm, u8 ch, u8 *ch_seq,
 
 static int s5xxx_ctrl_tx(struct wwan_port *port, struct sk_buff *skb)
 {
-	struct s5xxx_modem *sm = wwan_port_get_drvdata(port);
+	struct s5xxx_sit_ch *sc = wwan_port_get_drvdata(port);
+	struct s5xxx_modem *sm = sc->sm;
+	u32 needed = round_up(S5XXX_SIT_HDR + skb->len, 8);
 	int ret;
 
-	ret = s5xxx_fmt_ring_tx(sm, S5XXX_CH_FMT, &sm->fmt_ch_seq, S5XXX_FMT_MAX,
-				skb->data, skb->len);
+	/*
+	 * Block on a full FMT ring rather than returning -EBUSY: MM bursts the
+	 * SET_DATA_PROFILE / SET_INITIAL_ATTACH_APN / SETUP_DATA_CALL frames
+	 * back-to-back and the shallow FMT txq fills, which surfaced as
+	 * "Sending command failed: Device or resource busy" on connect. Mirror
+	 * s5xxx_oem_tx_blocking(): wait for the CP to drain (fmt_tx_wq, woken
+	 * from the IRQ handler) and retry.
+	 */
+	for (;;) {
+		ret = s5xxx_fmt_ring_tx(sm, sc->ch, &sc->ch_seq,
+					S5XXX_FMT_MAX, skb->data, skb->len);
+		if (ret != -EBUSY)
+			break;
+		ret = wait_event_interruptible_timeout(sm->fmt_tx_wq,
+				s5xxx_fmt_txq_space(sm) >= needed, HZ);
+		if (ret == 0)
+			ret = -ETIMEDOUT;
+		if (ret < 0)
+			break;
+	}
 	if (ret)
 		return ret;
 	consume_skb(skb);
@@ -1785,7 +2126,8 @@ static const struct wwan_port_ops s5xxx_ctrl_ops = {
  */
 static int s5xxx_oem_tx(struct wwan_port *port, struct sk_buff *skb)
 {
-	struct s5xxx_modem *sm = wwan_port_get_drvdata(port);
+	struct s5xxx_oem_ch *oc = wwan_port_get_drvdata(port);
+	struct s5xxx_modem *sm = oc->sm;
 	int ret;
 
 	if (!sm->online)
@@ -1793,7 +2135,7 @@ static int s5xxx_oem_tx(struct wwan_port *port, struct sk_buff *skb)
 	if (skb->len > S5XXX_FMT_MAX)
 		return -EMSGSIZE;
 
-	ret = s5xxx_fmt_ring_tx(sm, S5XXX_CH_OEM, &sm->oem_ch_seq, S5XXX_FMT_MAX,
+	ret = s5xxx_fmt_ring_tx(sm, oc->ch, &oc->ch_seq, S5XXX_FMT_MAX,
 				skb->data, skb->len);
 	if (ret == -EBUSY)
 		return -EAGAIN;
@@ -1810,7 +2152,8 @@ static int s5xxx_oem_tx(struct wwan_port *port, struct sk_buff *skb)
  */
 static int s5xxx_oem_tx_blocking(struct wwan_port *port, struct sk_buff *skb)
 {
-	struct s5xxx_modem *sm = wwan_port_get_drvdata(port);
+	struct s5xxx_oem_ch *oc = wwan_port_get_drvdata(port);
+	struct s5xxx_modem *sm = oc->sm;
 	u32 needed = round_up(S5XXX_SIT_HDR + skb->len, 8);
 	int ret;
 
@@ -1820,7 +2163,7 @@ static int s5xxx_oem_tx_blocking(struct wwan_port *port, struct sk_buff *skb)
 		return -EMSGSIZE;
 
 	for (;;) {
-		ret = s5xxx_fmt_ring_tx(sm, S5XXX_CH_OEM, &sm->oem_ch_seq,
+		ret = s5xxx_fmt_ring_tx(sm, oc->ch, &oc->ch_seq,
 					S5XXX_FMT_MAX, skb->data, skb->len);
 		if (ret != -EBUSY)
 			break;
@@ -1837,6 +2180,26 @@ static int s5xxx_oem_tx_blocking(struct wwan_port *port, struct sk_buff *skb)
 		return ret;
 	consume_skb(skb);
 	return 0;
+}
+
+static struct s5xxx_sit_ch *s5xxx_sit_lookup(struct s5xxx_modem *sm, u8 ch)
+{
+	int i;
+
+	for (i = 0; i < S5XXX_SIT_PORTS; i++)
+		if (sm->sit[i].ch == ch)
+			return &sm->sit[i];
+	return NULL;
+}
+
+static struct s5xxx_oem_ch *s5xxx_oem_lookup(struct s5xxx_modem *sm, u8 ch)
+{
+	int i;
+
+	for (i = 0; i < S5XXX_OEM_PORTS; i++)
+		if (sm->oem[i].ch == ch)
+			return &sm->oem[i];
+	return NULL;
 }
 
 static const struct wwan_port_ops s5xxx_oem_ops = {
@@ -2176,6 +2539,18 @@ static void s5xxx_rfs_cleanup(struct s5xxx_modem *sm)
  * (@intval is the cp2ap_msg sampled there; skbs GFP_ATOMIC), and bounds the
  * alloc against a corrupt CP length.
  */
+/*
+ * The netdev carrying PDP channel @ch, or NULL if @ch is not a data channel or
+ * its interface does not exist.  READ_ONCE because the DL drain and the raw-ring
+ * fallback both run in the hard IRQ, against s5xxx_online() publishing them.
+ */
+static struct net_device *s5xxx_pdp_ndev(struct s5xxx_modem *sm, u8 ch)
+{
+	if (ch < S5XXX_CH_PDP_FIRST || ch > S5XXX_PDP_CH_LAST)
+		return NULL;
+	return READ_ONCE(sm->ndev[ch - S5XXX_CH_PDP_FIRST]);
+}
+
 static void s5xxx_drain_raw_rxq(struct s5xxx_modem *sm, u32 intval)
 {
 	void __iomem *buff = sm->ipc + S5XXX_RAW_RXQ_BUFF;
@@ -2193,6 +2568,7 @@ static void s5xxx_drain_raw_rxq(struct s5xxx_modem *sm, u32 intval)
 	while (in != out) {
 		u32 usage = s5xxx_circ_usage(S5XXX_RAW_RXQ_SIZE, in, out);
 		u8 hdr[S5XXX_SIT_HDR];
+		struct net_device *pdp;
 		struct wwan_port *port;
 		u32 flen, total, plen, max;
 		u8 ch;
@@ -2212,6 +2588,7 @@ static void s5xxx_drain_raw_rxq(struct s5xxx_modem *sm, u32 intval)
 			break;			/* partial frame; wait for more */
 		ch = hdr[8];
 		plen = flen - S5XXX_SIT_HDR;
+		pdp = s5xxx_pdp_ndev(sm, ch);
 
 		if (ch == S5XXX_CH_RFS) {
 			had_raw = true;
@@ -2254,6 +2631,42 @@ static void s5xxx_drain_raw_rxq(struct s5xxx_modem *sm, u32 intval)
 				port = NULL;
 				max = 0;
 			}
+		} else if (ch == S5XXX_CH_GNSS_DUMP) {
+			port = sm->gnss_dump_port;
+			max = S5XXX_GNSS_DUMP_MAX;
+			had_raw = true;
+		} else if (pdp) {
+			/*
+			 * PS data on the legacy ring rather than on pktproc.
+			 * The CP uses this path for some contexts, and
+			 * downstream's rx_multi_pdp accepts these channels here
+			 * too; without it the packets are dropped as an unknown
+			 * channel while the interface looks up and idle.
+			 */
+			had_raw = true;
+			if (plen) {
+				struct sk_buff *skb = netdev_alloc_skb(pdp, plen);
+
+				if (skb) {
+					s5xxx_circ_read(skb_put(skb, plen), buff,
+							S5XXX_RAW_RXQ_SIZE,
+							(out + S5XXX_SIT_HDR) %
+								S5XXX_RAW_RXQ_SIZE,
+							plen);
+					skb->protocol =
+						htons((skb->data[0] >> 4) == 6 ?
+						      ETH_P_IPV6 : ETH_P_IP);
+					skb_reset_mac_header(skb);
+					skb_reset_network_header(skb);
+					pdp->stats.rx_packets++;
+					pdp->stats.rx_bytes += plen;
+					netif_rx(skb);
+				} else {
+					pdp->stats.rx_dropped++;
+				}
+			}
+			port = NULL;
+			max = 0;
 		} else {
 			port = NULL;
 			max = 0;
@@ -2336,6 +2749,8 @@ static void s5xxx_drain_fmt_rxq(struct s5xxx_modem *sm, u32 intval)
 
 	while (in != out) {
 		u32 usage = s5xxx_circ_usage(S5XXX_FMT_RXQ_SIZE, in, out);
+		struct s5xxx_oem_ch *oc;
+		struct s5xxx_sit_ch *sc;
 		u8 hdr[S5XXX_SIT_HDR];
 		u32 flen, total, plen;
 
@@ -2354,20 +2769,42 @@ static void s5xxx_drain_fmt_rxq(struct s5xxx_modem *sm, u32 intval)
 			break;			/* partial frame; wait for more */
 		plen = flen - S5XXX_SIT_HDR;
 
-		if (hdr[8] == S5XXX_CH_OEM) {
-			if (sm->oem_port && plen)
-				s5xxx_fmt_deliver(sm->oem_port, buff, out, plen);
+		oc = s5xxx_oem_lookup(sm, hdr[8]);
+		sc = oc ? NULL : s5xxx_sit_lookup(sm, hdr[8]);
+		if (oc) {
+			if (oc->port && plen)
+				s5xxx_fmt_deliver(oc->port, buff, out, plen);
 			/*
 			 * The CP opened an oem transaction and expects a
 			 * (multi-frame) reply; keep the link up so it drains at L0.
 			 */
 			s5xxx_fmt_mark_busy(sm);
-		} else if (hdr[8] != S5XXX_CH_FMT) {
-			dev_info_ratelimited(sm->dev,
-					     "fmt rxq drop unhandled ch %#x payload %u\n",
-					     hdr[8], plen);
-		} else if (sm->ctrl_port && plen) {
-			s5xxx_fmt_deliver(sm->ctrl_port, buff, out, plen);
+		} else if (!sc) {
+			u8 dump[256];
+			u32 n = min_t(u32, plen, sizeof(dump));
+
+			dev_info(sm->dev, "fmt rxq unhandled ch %#x payload %u\n",
+				 hdr[8], plen);
+			if (n) {
+				s5xxx_circ_read(dump, buff, S5XXX_FMT_RXQ_SIZE,
+						(out + S5XXX_SIT_HDR) % S5XXX_FMT_RXQ_SIZE,
+						n);
+				print_hex_dump(KERN_INFO, "s5xxx fmt rx: ",
+					       DUMP_PREFIX_OFFSET, 16, 1, dump, n,
+					       false);
+			}
+		} else if (plen) {
+			/*
+			 * Pairs with the smp_store_release() that publishes the
+			 * port: this runs in the hard IRQ and can see a channel
+			 * whose port is still being brought up.
+			 */
+			struct wwan_port *port = READ_ONCE(sc->port);
+
+			dev_dbg(sm->dev, "fmt rxq SIT ch %#x payload %u\n",
+				 hdr[8], plen);
+			if (port)
+				s5xxx_fmt_deliver(port, buff, out, plen);
 		}
 		out = (out + total) % S5XXX_FMT_RXQ_SIZE;
 	}
@@ -2400,7 +2837,8 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 	u32 n = S5XXX_PKTPROC_DL_NUM_DESC;
 	int q;
 
-	if (!sm->pktproc || !sm->ndev)
+	/* Pairs with the release in s5xxx_register_netdev(). */
+	if (!sm->pktproc || !smp_load_acquire(&sm->pdp_up))
 		return;
 
 	for (q = 0; q < S5XXX_PKTPROC_DL_NUM_QUEUE; q++) {
@@ -2425,15 +2863,26 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 			void __iomem *d = descs +
 					  done * S5XXX_PKTPROC_DESC_SKTBUF_SZ;
 			u32 len = readl(d + 8) & 0xffff;	/* length @ byte 8 */
+			u8 lcid = (readl(d + 12) >> 16) & 0xff;	/* lcid @ byte 14 */
+			struct net_device *tgt = s5xxx_pdp_ndev(sm, lcid);
 			struct sk_buff *skb;
 
+			if (!tgt) {
+				dev_warn_ratelimited(sm->dev,
+					"DL q%d lcid %#x has no netdev\n",
+					q, lcid);
+				goto next;	/* still drain and re-arm */
+			}
+			dev_info_ratelimited(sm->dev,
+				"DL q%d lcid %#x len %u -> %s\n",
+				q, lcid, len, netdev_name(tgt));
 			if (len == 0 || len > S5XXX_PKTPROC_DL_MAX_PKT) {
-				sm->ndev->stats.rx_length_errors++;
+				tgt->stats.rx_length_errors++;
 				goto next;
 			}
-			skb = netdev_alloc_skb(sm->ndev, len);
+			skb = netdev_alloc_skb(tgt, len);
 			if (!skb) {
-				sm->ndev->stats.rx_dropped++;
+				tgt->stats.rx_dropped++;
 				goto next;
 			}
 			memcpy_fromio(skb_put(skb, len),
@@ -2441,11 +2890,11 @@ static void s5xxx_pktproc_dl_drain(struct s5xxx_modem *sm)
 				      len);
 			skb->protocol = htons((skb->data[0] >> 4) == 6 ?
 					      ETH_P_IPV6 : ETH_P_IP);
-			skb->dev = sm->ndev;
+			skb->dev = tgt;
 			skb_reset_mac_header(skb);
 			skb_reset_network_header(skb);
-			sm->ndev->stats.rx_packets++;
-			sm->ndev->stats.rx_bytes += len;
+			tgt->stats.rx_packets++;
+			tgt->stats.rx_bytes += len;
 			netif_rx(skb);
 next:
 			done = (done + 1 == n) ? 0 : done + 1;
@@ -2486,16 +2935,29 @@ static void s5xxx_pktproc_ul_activate(struct s5xxx_modem *sm)
 {
 	void __iomem *info = sm->pktproc + S5XXX_PKTPROC_UL_INFO_OFS;
 	void __iomem *qinfo = info + 8 + S5XXX_PKTPROC_UL_TXQ * 20;
+	unsigned long flags;
 
 	if (!sm->pktproc)
 		return;
 
 	sm->ul_end_bit_owner = (readl(info) >> 24) & 1;
 	sm->ul_cp_quota = readl(info + 4) & 0xffff;
+
+	/*
+	 * Reset the producer state under the transmit lock.  This runs from the
+	 * hard IRQ on the CP's PHONE_START, against up to thirty netdevs each
+	 * with its own transmit queue: without the lock a transmit can publish a
+	 * descriptor into a ring whose pointers are being zeroed underneath it,
+	 * and the CP walks a fore_ptr that does not describe what is there.
+	 * Opening the gate last, inside the same section, publishes
+	 * end_bit_owner to the transmit path along with it.
+	 */
+	spin_lock_irqsave(&sm->tx_lock, flags);
 	sm->ul_done = 0;
 	writel(0, qinfo + 12);		/* fore_ptr (AP producer) */
 	writel(0, qinfo + 16);		/* rear_ptr (CP consumer) */
 	sm->ul_active = !!sm->pktproc;
+	spin_unlock_irqrestore(&sm->tx_lock, flags);
 
 	dev_info(sm->dev, "pktproc UL %s: end_bit_owner=%u cp_quota=%u\n",
 		 sm->ul_active ? "active" : "provisioned (UL cap withheld)",
@@ -2509,7 +2971,8 @@ static void s5xxx_pktproc_ul_activate(struct s5xxx_modem *sm)
  * ul_done needs no extra protection.  Returns false when the ring is full or the
  * frame is oversized -- the caller drops.
  */
-static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb)
+static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb,
+				  u8 lcid, bool publish)
 {
 	void __iomem *info = sm->pktproc + S5XXX_PKTPROC_UL_INFO_OFS;
 	void __iomem *qinfo = info + 8 + S5XXX_PKTPROC_UL_TXQ * 20;
@@ -2528,6 +2991,15 @@ static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb)
 		return false;
 
 	spin_lock_irqsave(&sm->tx_lock, flags);
+	/*
+	 * Under the lock, with the ring reset: a transmit that arrives while the
+	 * CP is restarting sees the gate closed and bails, so the reset cannot
+	 * land between a descriptor and the fore_ptr that hands it to the CP.
+	 */
+	if (!sm->ul_active) {
+		spin_unlock_irqrestore(&sm->tx_lock, flags);
+		return false;
+	}
 	slot = sm->ul_done;
 	rear = readl(qinfo + 16) % n;	/* rear_ptr (CP consumer) */
 	/* circ_space(n, fore=slot, rear): need at least one free descriptor. */
@@ -2540,7 +3012,15 @@ static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb)
 	buf = sm->pktproc + buff_base + slot * S5XXX_PKTPROC_UL_MAX_PKT;
 	cp_buf = S5XXX_PKTPROC_CP_BASE + buff_base +
 		 slot * S5XXX_PKTPROC_UL_MAX_PKT;
-	last = sm->ul_end_bit_owner == S5XXX_PKTPROC_END_BIT_AP ? 1 : 0;
+	/*
+	 * The end bit terminates a published batch, so only its last descriptor
+	 * carries one: vendor pktproc_ul_update_fore_ptr() sets it at fore-1 and
+	 * clears it on every enqueue.  Setting it on all of them leaves a stale
+	 * end bit sitting at fore once the ring has lapped, which is what the
+	 * CP walked into on 2026-08-31 -- both wedges ended with rear parked at
+	 * exactly fore+1 and the CP servicing neither direction again.
+	 */
+	last = (publish && sm->ul_end_bit_owner == S5XXX_PKTPROC_END_BIT_AP) ? 1 : 0;
 
 	memcpy_toio(buf, skb->data, skb->len);
 	writel(dsize, desc + 0x0);		/* data_size (+CP_PADDING) */
@@ -2548,19 +3028,38 @@ static bool s5xxx_pktproc_ul_xmit(struct s5xxx_modem *sm, struct sk_buff *skb)
 	writel(cp_buf, desc + 0x8);		/* sktbuf_point[31:0] */
 	writel(0, desc + 0xc);			/* sktbuf_point[35:32] + pbp */
 	writel(last, desc + 0x10);		/* last_desc (bit0) */
-	writel(S5XXX_CH_PDP_FIRST << 8, desc + 0x14);	/* lcid @ byte 21 */
+	writel(lcid << 8, desc + 0x14);		/* lcid @ byte 21 */
 	writel(0, desc + 0x18);
 	writel(0, desc + 0x1c);
 
 	slot = (slot + 1 == n) ? 0 : slot + 1;
 	sm->ul_done = slot;
+	if (!publish) {
+		/* More skbs queued behind this one: leave fore_ptr alone and let
+		 * the burst's last packet publish them all with one doorbell,
+		 * the way the vendor's tx timer batches. */
+		spin_unlock_irqrestore(&sm->tx_lock, flags);
+		return true;
+	}
 	wmb();				/* descriptor + payload land before fore */
 	writel(slot, qinfo + 12);	/* fore_ptr (AP producer) */
 	spin_unlock_irqrestore(&sm->tx_lock, flags);
 
+	dev_dbg_ratelimited(sm->dev, "UL lcid %#x len %u dsize %u\n",
+			     lcid, skb->len, dsize);
 	s5xxx_send_ipc_irq(sm, S5XXX_INT_VALID | S5XXX_INT_SEND_RAW);
 	return true;
 }
+
+/*
+ * Private area of a raw-IP data netdev: the PDP channel it carries.  Uplink is
+ * tagged with that channel so the CP keys it to the same context downlink
+ * arrived on.
+ */
+struct s5xxx_rmnet_priv {
+	struct s5xxx_modem *sm;
+	u8 ch;
+};
 
 static int s5xxx_ndo_open(struct net_device *ndev)
 {
@@ -2577,8 +3076,22 @@ static int s5xxx_ndo_stop(struct net_device *ndev)
 static netdev_tx_t s5xxx_ndo_start_xmit(struct sk_buff *skb,
 					struct net_device *ndev)
 {
-	struct s5xxx_modem *sm = *(struct s5xxx_modem **)netdev_priv(ndev);
+	struct s5xxx_rmnet_priv *priv = netdev_priv(ndev);
+	struct s5xxx_modem *sm = priv->sm;
 	unsigned int len;
+
+	/*
+	 * CP-driven TX flow control: the CP asked for uplink silence, so hold the
+	 * packet in the qdisc until it resumes rather than dropping it.  The
+	 * re-check closes the race with a resume landing between the flag read
+	 * and the queue stop.
+	 */
+	if (READ_ONCE(sm->tx_suspended)) {
+		netif_stop_queue(ndev);
+		if (READ_ONCE(sm->tx_suspended))
+			return NETDEV_TX_BUSY;
+		netif_wake_queue(ndev);
+	}
 
 	/*
 	 * ul_xmit copies only the linear head; no scatter-gather feature is
@@ -2591,7 +3104,8 @@ static netdev_tx_t s5xxx_ndo_start_xmit(struct sk_buff *skb,
 	}
 	len = skb->len;
 
-	if (sm->ul_active && s5xxx_pktproc_ul_xmit(sm, skb)) {
+	/* ul_active is tested under tx_lock inside ul_xmit, not here. */
+	if (s5xxx_pktproc_ul_xmit(sm, skb, priv->ch, !netdev_xmit_more())) {
 		ndev->stats.tx_packets++;
 		ndev->stats.tx_bytes += len;
 	} else {
@@ -2622,42 +3136,74 @@ static void s5xxx_netdev_setup(struct net_device *ndev)
 }
 
 /*
- * Register the raw-IP data netdev (rmnet0).  Called from s5xxx_online: RX is
- * guarded by sm->ndev in the drain and TX by sm->ul_active, so the interface
- * appears exactly when the modem is ONLINE.  pktproc-off (legacy IPC) builds
- * skip it -- there is no UL/DL ring to back it.
+ * Register one raw-IP data netdev per PDP channel (rmnet0..rmnet29).  Called
+ * from s5xxx_online: RX is gated on sm->pdp_up in the drain and TX on
+ * sm->ul_active, so the interfaces appear exactly when the modem is ONLINE.
+ * pktproc-off (legacy IPC) builds skip it -- there is no UL/DL ring to back it.
+ *
+ * The whole range comes up at once rather than on demand: there is no control
+ * path for userspace to ask for an interface, and a modem stack picks the one
+ * for a PDP context by name.  They are cheap while down.
  */
 static void s5xxx_register_netdev(struct s5xxx_modem *sm)
 {
-	struct net_device *ndev;
-	int ret;
+	int i;
 
-	if (!sm->pktproc || sm->ndev)
+	if (!sm->pktproc || sm->ndev[0])
 		return;
 
-	ndev = alloc_netdev(sizeof(struct s5xxx_modem *), "rmnet%d",
-			    NET_NAME_ENUM, s5xxx_netdev_setup);
-	if (!ndev) {
-		dev_err(sm->dev, "failed to allocate rmnet netdev\n");
-		return;
+	/*
+	 * Name each interface explicitly rather than letting "rmnet%d"
+	 * enumerate.  The trailing index *is* the channel offset, and a bearer
+	 * picks its interface by that name, so it must not slide if some other
+	 * rmnet is already up -- which is exactly what %d allocation would do.
+	 *
+	 * An interface that will not register is logged and skipped. Thirty
+	 * registrations are thirty chances to fail, and losing the whole set --
+	 * or the rest of it -- over one name already taken would cost data
+	 * contexts that have nothing to do with it. The slot stays NULL, which
+	 * the uplink, both downlink demuxes and the flow-control walk all
+	 * already handle.
+	 */
+	for (i = 0; i < S5XXX_PDP_CH_COUNT; i++) {
+		struct s5xxx_rmnet_priv *priv;
+		struct net_device *ndev;
+		char name[IFNAMSIZ];
+		int ret;
+
+		snprintf(name, sizeof(name), "rmnet%d", i);
+		ndev = alloc_netdev(sizeof(*priv), name, NET_NAME_PREDICTABLE,
+				    s5xxx_netdev_setup);
+		if (!ndev) {
+			dev_err(sm->dev, "alloc_netdev(%s) failed\n", name);
+			continue;
+		}
+		priv = netdev_priv(ndev);
+		priv->sm = sm;
+		priv->ch = S5XXX_CH_PDP_FIRST + i;
+		SET_NETDEV_DEV(ndev, sm->dev);
+
+		ret = register_netdev(ndev);
+		if (ret) {
+			dev_err(sm->dev, "register_netdev(%s): %d\n", name, ret);
+			free_netdev(ndev);
+			continue;
+		}
+		WRITE_ONCE(sm->ndev[i], ndev);
 	}
-	*(struct s5xxx_modem **)netdev_priv(ndev) = sm;
-	SET_NETDEV_DEV(ndev, sm->dev);
+	dev_info(sm->dev, "raw-IP data netdevs up (%s.. ch %#x..%#x)\n",
+		 sm->ndev[0] ? netdev_name(sm->ndev[0]) : "none",
+		 S5XXX_CH_PDP_FIRST, S5XXX_PDP_CH_LAST);
 
-	ret = register_netdev(ndev);
-	if (ret) {
-		dev_err(sm->dev, "failed to register rmnet netdev: %d\n", ret);
-		free_netdev(ndev);
-		return;
-	}
-	sm->ndev = ndev;
-	dev_info(sm->dev, "raw-IP data netdev %s up (ch %#x)\n",
-		 ndev->name, S5XXX_CH_PDP_FIRST);
+	/* Publish the interfaces before the drain may deliver into them. */
+	smp_store_release(&sm->pdp_up, true);
 }
 
 /* Expose the runtime control channel once the CP is ONLINE (process context). */
 static void s5xxx_online(struct s5xxx_modem *sm)
 {
+	int i;
+
 	if (sm->at_port)
 		return;
 
@@ -2721,20 +3267,30 @@ static void s5xxx_online(struct s5xxx_modem *sm)
 		 S5XXX_CH_AT);
 
 	/*
-	 * The SIT control plane (umts_ipc0, FMT ring, ch 0xF5).  The CP services
-	 * the secondary channels (umts_router AT) only once this control plane is
-	 * driven and its REQ_ACK round-trips answered, so expose it as its own
-	 * port for a userspace RIL to run the modem init handshake.
+	 * The SIT control plane (umts_ipc0/1, FMT ring, ch 245/246).  The CP
+	 * services the secondary channels (umts_router AT) only once this control
+	 * plane is driven and its REQ_ACK round-trips answered, so expose it for a
+	 * userspace RIL to run the modem init handshake.  Registered in channel
+	 * order, so they name as wwan0sit0 and wwan0sit1.
 	 */
-	sm->ctrl_port = wwan_create_port(sm->dev, WWAN_PORT_SIT, &s5xxx_ctrl_ops,
-					 NULL, sm);
-	if (IS_ERR(sm->ctrl_port)) {
-		dev_err(sm->dev, "failed to create SIT port: %ld\n",
-			PTR_ERR(sm->ctrl_port));
-		sm->ctrl_port = NULL;
-	} else {
-		dev_info(sm->dev, "SIT control port up (umts_ipc0, ch %u)\n",
-			 S5XXX_CH_FMT);
+	for (i = 0; i < S5XXX_SIT_PORTS; i++) {
+		struct s5xxx_sit_ch *sc = &sm->sit[i];
+		struct wwan_port *port;
+
+		port = wwan_create_port(sm->dev, WWAN_PORT_SIT, &s5xxx_ctrl_ops,
+					NULL, sc);
+		if (IS_ERR(port)) {
+			dev_err(sm->dev, "failed to create SIT port %u: %ld\n",
+				sc->ch, PTR_ERR(port));
+			continue;
+		}
+		/*
+		 * The FMT drain reads this pointer in the hard IRQ and
+		 * dereferences it, so order the port's init ahead of the store.
+		 */
+		smp_store_release(&sc->port, port);
+		dev_info(sm->dev, "SIT control port up (umts_ipc%d, ch %u)\n",
+			 sc->ch - S5XXX_CH_FMT, sc->ch);
 	}
 
 	/*
@@ -2755,19 +3311,26 @@ static void s5xxx_online(struct s5xxx_modem *sm)
 	}
 
 	/*
-	 * The oem/GEMS channel (ch 0x82 on the FMT ring): post-ONLINE the CP streams
-	 * UE-capability-config file requests here and asserts if they go unanswered.
-	 * A userspace daemon answers them over this port; the kernel is transport only.
+	 * The oem/GEMS channels on the FMT ring: post-ONLINE the CP streams
+	 * UE-capability-config file requests on 0x82 and GEMS GIPC requests on
+	 * 0x84, and asserts if they go unanswered.  A userspace daemon answers
+	 * them over these ports; the kernel is transport only.  Ports come up in
+	 * channel order, so they are wwan0oem0/1/2 for 0x81/0x82/0x84.
 	 */
-	sm->oem_port = wwan_create_port(sm->dev, WWAN_PORT_OEM, &s5xxx_oem_ops,
-					NULL, sm);
-	if (IS_ERR(sm->oem_port)) {
-		dev_err(sm->dev, "failed to create OEM port: %ld\n",
-			PTR_ERR(sm->oem_port));
-		sm->oem_port = NULL;
-	} else {
-		dev_info(sm->dev, "OEM/GEMS port up (oem_ipc1, ch %#x)\n",
-			 S5XXX_CH_OEM);
+	for (i = 0; i < S5XXX_OEM_PORTS; i++) {
+		struct s5xxx_oem_ch *oc = &sm->oem[i];
+		struct wwan_port *port;
+
+		port = wwan_create_port(sm->dev, WWAN_PORT_OEM, &s5xxx_oem_ops,
+					NULL, oc);
+		if (IS_ERR(port)) {
+			dev_err(sm->dev, "failed to create OEM port %#x: %ld\n",
+				oc->ch, PTR_ERR(port));
+			continue;
+		}
+		oc->port = port;
+		dev_info(sm->dev, "OEM/GEMS port up (oem_ipc%d, ch %#x)\n",
+			 oc->ch - S5XXX_CH_OEM0, oc->ch);
 	}
 
 	/*
@@ -2782,6 +3345,21 @@ static void s5xxx_online(struct s5xxx_modem *sm)
 	} else {
 		dev_info(sm->dev, "GNSS boot port up (gnss_boot, ch %#x)\n",
 			 S5XXX_CH_GNSS_BOOT);
+	}
+
+	/*
+	 * The receiver's diagnostic-and-aiding channel.  Created after the boot
+	 * port so the two name as gnss0 and gnss1 in channel order.
+	 */
+	sm->gnss_dump_port = wwan_create_port(sm->dev, WWAN_PORT_GNSS,
+					      &s5xxx_gnss_dump_ops, NULL, sm);
+	if (IS_ERR(sm->gnss_dump_port)) {
+		dev_err(sm->dev, "failed to create GNSS dump port: %ld\n",
+			PTR_ERR(sm->gnss_dump_port));
+		sm->gnss_dump_port = NULL;
+	} else {
+		dev_info(sm->dev, "GNSS dump port up (gnss_dump, ch %#x)\n",
+			 S5XXX_CH_GNSS_DUMP);
 	}
 
 	/*
@@ -2987,6 +3565,19 @@ static void s5xxx_send_boot_image(struct s5xxx_modem *sm, size_t off,
 static int s5xxx_poll_cp_wakeup(struct s5xxx_modem *sm)
 {
 	int val, ret;
+
+	/*
+	 * Fresh-vs-stale discriminator for the dump bounce.  link_down() drops
+	 * AP2CP_WAKEUP (pci-exynos.c), which tells a live CP to re-handshake by
+	 * dropping then re-raising CP2AP_WAKEUP.  If CP2AP_WAKEUP is ALREADY high
+	 * on entry (link_down has had ms to let the CP react), the CP did not
+	 * re-request -- the poll below then latches a stale high and the relink
+	 * trains against a CP that is not re-handshaking (chase in-place decode,
+	 * not the retrain).  If it is low here, the CP reacted and the poll
+	 * catches the fresh rising edge (the retrain itself is the wall).
+	 */
+	dev_info(sm->dev, "CP2AP_WAKEUP on poll entry = %d (0=fresh re-request pending, 1=stale)\n",
+		 gpiod_get_value_cansleep(sm->cp2ap_wakeup));
 
 	ret = read_poll_timeout(gpiod_get_value_cansleep, val, val,
 				S5XXX_POLL_INTERVAL_US, S5XXX_POLL_TIMEOUT_US,
@@ -3357,6 +3948,7 @@ static int s5xxx_download_main(struct s5xxx_modem *sm)
 {
 	const struct s5xxx_toc_entry *toc = (const void *)sm->pbl->data;
 	u8 *scratch;
+	u32 stages_used;
 	int i, ret = 0;
 
 	/*
@@ -3380,6 +3972,7 @@ static int s5xxx_download_main(struct s5xxx_modem *sm)
 	/* The ring was armed in boot mode at boot_work() start; reset framing. */
 	sm->frame_seq = 0;
 	sm->ch_seq = 0;
+	stages_used = 0;
 
 	for (i = 0; i < (int)sm->var->n_dl_secs; i++) {
 		const struct s5xxx_dl_sec *d = &sm->var->dl_secs[i];
@@ -3393,9 +3986,23 @@ static int s5xxx_download_main(struct s5xxx_modem *sm)
 		u32 crc = 0;
 		u8 tag;
 
-		/* Stage from the image; table order only as a fallback. */
-		if (!s5xxx_find_stage(sm, d->toc_name, &tag))
+		/*
+		 * Stage from the image; table order only as a fallback -- and
+		 * also as the fallback when the image repeats a stage it has
+		 * already used.  The s5400 factory TOC declares REPLAY misc=9,
+		 * the same stage as NV_PROT, so honouring it verbatim streams
+		 * two sections as stage 9 and never sends a stage 10.
+		 */
+		if (!s5xxx_find_stage(sm, d->toc_name, &tag) ||
+		    (tag < 32 && (stages_used & BIT(tag)))) {
+			if (tag < 32 && (stages_used & BIT(tag)))
+				dev_info(sm->dev,
+					 "%s: TOC repeats stage %u; using %d\n",
+					 name, tag, i + 1);
 			tag = i + 1;
+		}
+		if (tag < 32)
+			stages_used |= BIT(tag);
 
 		if (!d->toc_name) {
 			/* Stage 1: the raw TOC table (first record spans it). */
@@ -3594,15 +4201,17 @@ static void s5xxx_load_gnss_fw(struct s5xxx_modem *sm)
 	release_firmware(fw);
 }
 
-static void s5xxx_boot_work(struct work_struct *work)
+/*
+ * Drive the mask ROM up to a running bootloader: clear the boot status words,
+ * arm the shared-memory IPC region, then feed it the BOOT section.  Shared by
+ * the normal boot and the dump boot, which differ only in what the ROM does
+ * with it and in everything that happens afterwards.
+ */
+static int s5xxx_boot_bootloader(struct s5xxx_modem *sm)
 {
-	struct s5xxx_modem *sm = container_of(work, struct s5xxx_modem,
-					      boot_work);
 	struct pci_dev *pdev = sm->pdev;
 	size_t bl1_size, btl_off, btl_size;
 	int ret, i, attempt;
-
-	s5xxx_drive_partial_rst(sm);
 
 	for (attempt = 0; ; attempt++) {
 		/*
@@ -3678,9 +4287,9 @@ static void s5xxx_boot_work(struct work_struct *work)
 			ret = s5xxx_poll_boot_stage(sm, sm->var->boot_done);
 		}
 		if (!ret)
-			break;
+			return 0;
 		if (attempt >= 1)
-			goto out_fw;
+			return ret;
 
 		/*
 		 * Boot wedged (boot_stage stuck, sometimes err_report 0xc) --
@@ -3695,14 +4304,263 @@ static void s5xxx_boot_work(struct work_struct *work)
 		if (ret) {
 			dev_err(sm->dev, "post-power-cycle relink failed: %d\n",
 				ret);
-			goto out_fw;
+			return ret;
 		}
+		/*
+		 * Re-sync the core's idea of the endpoint's power state before
+		 * touching the MSI capability.  A crash caught while the CP had
+		 * the link parked leaves the endpoint D3hot *in software*: the
+		 * park quiesced it and cleared bus-master, and relink_restore()
+		 * -- the only path back to D0 -- never ran, because the relink
+		 * itself failed on the dying CP.  The power cycle above put the
+		 * hardware back in D0, but until the core agrees the MSI target
+		 * write is silently dropped and the ROM boots with a zero
+		 * boot-status DMA target: every recovery attempt then sits at
+		 * boot_stage 0 and the crash reason is never decoded.
+		 */
+		pci_set_power_state(pdev, PCI_D0);
 		pci_restore_state(pdev);
 		pci_set_master(pdev);
 		s5xxx_open_bridge_window(sm);
 		zumapro_pcie_set_msi_target(sm->rc_dev, sm->msi_phys);
 		s5xxx_verify_msi_target(sm);
 	}
+}
+
+/*
+ * Dump-boot the CP and print the crash reason.
+ *
+ * The CP's crash record lives at IPC+0x400000 but is ENCODED, so reading it
+ * after a crash yields high-entropy noise.  Resetting with AP2CP_DUMP_NOTI
+ * latched makes the ROM start its minidump agent instead of a normal boot; the
+ * agent rewrites that record in place as an ASCII SRINFO/JSON blob naming the
+ * assert.  So: dump-reset, re-run the PBL download to get the agent running,
+ * then read what it left behind.  Only the bootloader stage runs -- no MAIN, no
+ * re-link -- which is why this leaves the modem down until the next rebind.
+ *
+ * Deliberately manual (debugfs), not wired to the crash IRQ: an automatic
+ * dump-boot on every crash would fight the normal boot path for the link.
+ */
+#define S5XXX_SRINFO_DUMP_MAX	2048
+
+static void s5xxx_link_diag(struct s5xxx_modem *sm, const char *tag)
+{
+	u32 lnkcap = 0;
+	u16 lnksta = 0, lnkctl2 = 0;
+
+	/*
+	 * EP-side config space over the live link: what the PBL left the CP
+	 * endpoint advertising/targeting.  Read at the two dump-boot moments that
+	 * differ -- right after the dump warm-reset (link trains) vs right after
+	 * the PBL reaches boot_stage DONE (link then refuses to retrain) -- so the
+	 * prime suspect (the EP reconfiguring its own width/speed during the PBL
+	 * run) can be diffed straight from the endpoint.  Module-only (sm->pdev),
+	 * so it stays hot-swappable; RC-side LTSSM is already logged by the relink
+	 * attempts and reads L0 at both trained moments anyway.
+	 */
+	pcie_capability_read_dword(sm->pdev, PCI_EXP_LNKCAP, &lnkcap);
+	pcie_capability_read_word(sm->pdev, PCI_EXP_LNKSTA, &lnksta);
+	pcie_capability_read_word(sm->pdev, PCI_EXP_LNKCTL2, &lnkctl2);
+	dev_info(sm->dev,
+		 "link_diag[%s]: EP LNKSTA %#x (CLS %u NLW %u) LNKCAP %#x (SLS %u MLW %u) LNKCTL2 %#x\n",
+		 tag, lnksta, lnksta & PCI_EXP_LNKSTA_CLS,
+		 (lnksta & PCI_EXP_LNKSTA_NLW) >> PCI_EXP_LNKSTA_NLW_SHIFT,
+		 lnkcap, lnkcap & PCI_EXP_LNKCAP_SLS,
+		 (lnkcap & PCI_EXP_LNKCAP_MLW) >> 4, lnkctl2);
+}
+
+static int s5xxx_dump_boot(struct s5xxx_modem *sm)
+{
+	const char *fw_name;
+	u8 *buf;
+	int ret, i;
+
+	/* A reset is what earns the CP another relink budget. */
+	sm->relink_failures = 0;
+
+	if (sm->pbl)
+		return -EBUSY;			/* a boot is already in flight */
+
+	if (of_property_read_string(sm->dev->of_node, "firmware-name", &fw_name))
+		fw_name = "tegu/cp_pbl.bin";
+	ret = request_firmware(&sm->pbl, fw_name, sm->dev);
+	if (ret) {
+		dev_err(sm->dev, "dump boot: no %s: %d\n", fw_name, ret);
+		return ret;
+	}
+	s5xxx_find_boot(sm);
+
+	/*
+	 * Quiesce runtime PM first (downstream start_dump_boot(): "do not handle
+	 * cp2ap_wakeup irq during dump process").  Left armed, the wakeup IRQ
+	 * races the dump boot for the link: pm_work relinks behind our back while
+	 * the CP is still bringing its own PHY up, which parks the LTSSM in
+	 * Polling and every retrain then fails with -110.
+	 */
+	mutex_lock(&sm->pcie_onoff_lock);
+	if (sm->pm_armed) {
+		disable_irq(sm->cp2ap_irq);
+		sm->pm_armed = false;
+	}
+	mutex_unlock(&sm->pcie_onoff_lock);
+	cancel_work_sync(&sm->pm_work);
+	sm->link_up = true;
+
+	dev_info(sm->dev, "dump boot: resetting the CP into minidump mode\n");
+	ret = zumapro_pcie_modem_dump_reset(sm->rc_dev);
+	if (ret) {
+		dev_err(sm->dev, "dump boot: reset/relink failed: %d\n", ret);
+		goto out;
+	}
+	pci_restore_state(sm->pdev);
+	pci_set_master(sm->pdev);
+	s5xxx_open_bridge_window(sm);
+	zumapro_pcie_set_msi_target(sm->rc_dev, sm->msi_phys);
+	s5xxx_link_diag(sm, "after-dump-reset");
+
+	ret = s5xxx_boot_bootloader(sm);
+	if (ret) {
+		dev_err(sm->dev, "dump boot: bootloader did not come up: %d\n",
+			ret);
+		goto out;
+	}
+	s5xxx_link_diag(sm, "after-pbl-done");
+	/*
+	 * Bounce the PCIe link exactly as cpif start_dump_boot() does once the
+	 * dump PBL reaches boot_stage DONE: poweroff -> wait CP2AP_WAKEUP ->
+	 * poweron (s5100_poweroff_pcie / check_cp_status(false) /
+	 * s5100_poweron_pcie in modem_ctrl_s5100.c).  The srinfo-decoding minidump
+	 * agent runs in the stage the CP loads only AFTER this bounce, which is
+	 * why the earlier no-bounce dump reached the PBL (srinfo head 03->09) but
+	 * never decoded.  cpif source proves the dump-mode CP DOES re-request the
+	 * link via CP2AP_WAKEUP -- but only after the AP powers the link down
+	 * first (check_cp_status polls CP2AP_WAKEUP *after* poweroff); the earlier
+	 * failed attempt waited without that ordering.  Reuse the proven
+	 * normal-boot bounce primitives.
+	 *
+	 * Unlike the normal boot, do NOT ring LINK_ACK afterwards: cpif skips the
+	 * link-ack doorbell while phone_state == CRASH_EXIT so the CP runs its
+	 * minidump path instead of proceeding to MAIN (which would clobber the
+	 * crash record).  A failed relink leaves the modem down (recoverable by
+	 * rebind); with no LINK_ACK and a single attempt it cannot wedge the SoC.
+	 */
+	if (pci_set_power_state(sm->pdev, PCI_D3hot))
+		dev_warn(sm->dev, "dump boot: could not D3hot before the bounce\n");
+	dev_info(sm->dev,
+		 "dump boot: PBL up (CP2AP_WAKEUP=%d); bouncing the link for the minidump agent\n",
+		 gpiod_get_value_cansleep(sm->cp2ap_wakeup));
+	ret = zumapro_pcie_modem_link_down(sm->rc_dev);
+	if (ret)
+		goto out;
+	ret = s5xxx_poll_cp_wakeup(sm);
+	if (ret)
+		goto out;
+	ret = zumapro_pcie_modem_link_up(sm->rc_dev);
+	if (ret) {
+		dev_err(sm->dev, "dump boot: link re-establishment failed: %d\n",
+			ret);
+		goto out;
+	}
+	pci_set_power_state(sm->pdev, PCI_D0);
+	pci_restore_state(sm->pdev);
+	pci_set_master(sm->pdev);
+	zumapro_pcie_set_msi_target(sm->rc_dev, sm->msi_phys);
+	s5xxx_open_bridge_window(sm);
+	s5xxx_verify_msi_target(sm);
+
+	buf = kmalloc(S5XXX_SRINFO_DUMP_MAX, GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	/* Poll for the decoded record for up to 30 s (60 x 500 ms). */
+	for (i = 0; i < 60; i++) {
+		memcpy_fromio(buf, sm->ipc + S5XXX_IPC_SRINFO_OFFSET, 8);
+		if (!memcmp(buf, "SRINFO", 6)) {
+			dev_info(sm->dev,
+				 "dump boot: SRINFO magic after %d ms\n",
+				 i * 500);
+			break;
+		}
+		msleep(500);
+	}
+	if (i == 60)
+		dev_info(sm->dev,
+			 "dump boot: no SRINFO magic after 30 s (head follows)\n");
+
+	memcpy_fromio(buf, sm->ipc + S5XXX_IPC_SRINFO_OFFSET,
+		      S5XXX_SRINFO_DUMP_MAX);
+	dev_info(sm->dev, "dump boot: srinfo record follows\n");
+	print_hex_dump(KERN_INFO, "s5xxx srinfo: ", DUMP_PREFIX_OFFSET, 16, 1,
+		       buf, S5XXX_SRINFO_DUMP_MAX, true);
+	kfree(buf);
+out:
+	release_firmware(sm->pbl);
+	sm->pbl = NULL;
+	return ret;
+}
+
+/*
+ * The whole srinfo region, raw, so it can be pulled off and searched without a
+ * kernel build per hypothesis: the minidump agent's decoded record carries an
+ * 8-byte magic somewhere in these 3 MB and is not necessarily at offset 0.
+ */
+static ssize_t s5xxx_srinfo_read(struct file *file, char __user *ubuf,
+				 size_t count, loff_t *ppos)
+{
+	struct s5xxx_modem *sm = file->private_data;
+	size_t max = min_t(size_t, S5XXX_IPC_SRINFO_SIZE,
+			   sm->ipc_size - S5XXX_IPC_SRINFO_OFFSET);
+	ssize_t ret;
+	void *buf;
+
+	if (*ppos >= max)
+		return 0;
+	count = min_t(size_t, count, max - *ppos);
+	count = min_t(size_t, count, SZ_64K);
+
+	buf = kmalloc(count, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	memcpy_fromio(buf, sm->ipc + S5XXX_IPC_SRINFO_OFFSET + *ppos, count);
+	ret = simple_read_from_buffer(ubuf, count, &(loff_t){ 0 }, buf, count);
+	if (ret > 0)
+		*ppos += ret;
+	kfree(buf);
+	return ret;
+}
+
+static const struct file_operations s5xxx_srinfo_fops = {
+	.owner	= THIS_MODULE,
+	.open	= simple_open,
+	.read	= s5xxx_srinfo_read,
+	.llseek	= default_llseek,
+};
+
+static int s5xxx_dump_boot_set(void *data, u64 val)
+{
+	struct s5xxx_modem *sm = data;
+
+	if (!val)
+		return 0;
+	return s5xxx_dump_boot(sm);
+}
+DEFINE_DEBUGFS_ATTRIBUTE(s5xxx_dump_boot_fops, NULL, s5xxx_dump_boot_set,
+			 "%llu\n");
+
+static void s5xxx_boot_work(struct work_struct *work)
+{
+	struct s5xxx_modem *sm = container_of(work, struct s5xxx_modem,
+					      boot_work);
+	struct pci_dev *pdev = sm->pdev;
+	int ret;
+
+	s5xxx_drive_partial_rst(sm);
+
+	ret = s5xxx_boot_bootloader(sm);
+	if (ret)
+		goto out_fw;
 
 	/* Clear boot_stage before the re-link (vendor clears it here too). */
 	writel(0, sm->msi + S5XXX_MSI_BOOT_STAGE);
@@ -3899,7 +4757,7 @@ static int s5xxx_probe(struct platform_device *pdev)
 	struct s5xxx_modem *sm;
 	const char *fw_name;
 	u16 cmd;
-	int ret;
+	int ret, i;
 
 	sm = devm_kzalloc(dev, sizeof(*sm), GFP_KERNEL);
 	if (!sm)
@@ -3920,6 +4778,18 @@ static int s5xxx_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&sm->rfs_rxq);
 	spin_lock_init(&sm->rfs_lock);
 	init_waitqueue_head(&sm->fmt_tx_wq);
+	for (i = 0; i < S5XXX_OEM_PORTS; i++) {
+		static const u8 oem_chs[S5XXX_OEM_PORTS] = {
+			S5XXX_CH_OEM0, S5XXX_CH_OEM, S5XXX_CH_OEM3,
+		};
+
+		sm->oem[i].sm = sm;
+		sm->oem[i].ch = oem_chs[i];
+	}
+	for (i = 0; i < S5XXX_SIT_PORTS; i++) {
+		sm->sit[i].sm = sm;
+		sm->sit[i].ch = S5XXX_CH_FMT + i;
+	}
 	sm->link_up = true;	/* boot handshake rings directly; PM arms at ONLINE */
 	platform_set_drvdata(pdev, sm);
 
@@ -4127,6 +4997,7 @@ static int s5xxx_probe(struct platform_device *pdev)
 			ret, sm->pdev->current_state, sm->pdev->msi_cap);
 		goto err_disable;
 	}
+	sm->nvec = ret;
 	dev_info(dev, "%d MSI vector(s) (reserved base 4)\n", ret);
 
 	/*
@@ -4150,13 +5021,36 @@ static int s5xxx_probe(struct platform_device *pdev)
 		goto err_vectors;
 
 	/*
+	 * Vector 1 is the CP's cp2ap_status TX flow-control interrupt.  A vector
+	 * that is never requested stays disabled in iMSI-RX, so the CP's suspend
+	 * request would be dropped at the RC and uplink would keep flowing into a
+	 * quiescing modem.  This mask ROM advertises MMC=0, so only one vector is
+	 * usually allocated and there is nothing to hook; take it when the part
+	 * does give us more.
+	 */
+	if (sm->nvec > 1) {
+		ret = request_irq(pci_irq_vector(sm->pdev, 1),
+				  s5xxx_tx_state_irq, 0, "s5xxx-tx-state", sm);
+		if (ret)
+			goto err_irq0;
+	} else {
+		dev_info(dev, "one MSI vector: CP TX flow control not hooked\n");
+	}
+
+	/*
 	 * CP-driven runtime PCIe PM: the CP toggles CP2AP_WAKEUP to ask for the
 	 * link back (or announce it is parking).  Requested disabled (IRQF_NO_AUTOEN)
 	 * -- the boot path still polls this GPIO for the mid-boot re-link -- and
 	 * enabled once the CP reaches ONLINE (PHONE_START).  Ordered wq: relinks
 	 * must not race.
 	 */
-	sm->pm_wq = alloc_ordered_workqueue("s5xxx-pm", 0);
+	/*
+	 * Freezable: wake IRQs are enabled before resume_early reopens the
+	 * always-on HSI1 S2MPU, and relinking in that window lets the CP fault
+	 * its first shared-memory DMA.  A worker queued while frozen reads the
+	 * current GPIO level once it thaws, so no edge is lost.
+	 */
+	sm->pm_wq = alloc_ordered_workqueue("s5xxx-pm", WQ_FREEZABLE);
 	if (!sm->pm_wq) {
 		ret = -ENOMEM;
 		goto err_irq;
@@ -4186,6 +5080,17 @@ static int s5xxx_probe(struct platform_device *pdev)
 	}
 
 	/*
+	 * The CP asks for the link on this line, and it has to be able to do so
+	 * while the AP is asleep -- otherwise an incoming call or SMS waits for
+	 * something else to wake us.
+	 */
+	ret = enable_irq_wake(sm->cp2ap_irq);
+	if (ret) {
+		dev_err(dev, "CP2AP_WAKEUP enable_irq_wake: %d\n", ret);
+		goto err_cp2ap_irq;
+	}
+
+	/*
 	 * Armed from the start (unlike the wakeup IRQ): logs the CP coming
 	 * alive during boot and any crash after ONLINE.  Non-fatal if missing.
 	 */
@@ -4202,16 +5107,26 @@ static int s5xxx_probe(struct platform_device *pdev)
 			dev_warn(dev, "CP2AP_PHONE_ACTIVE irq unavailable\n");
 	}
 
+	sm->dbgfs = debugfs_create_dir("s5xxx-modem", NULL);
+	debugfs_create_file("dump_boot", 0200, sm->dbgfs, sm,
+			    &s5xxx_dump_boot_fops);
+	debugfs_create_file("srinfo", 0400, sm->dbgfs, sm, &s5xxx_srinfo_fops);
+
 	/* The oem/GEMS port (ch 0x82) comes up with the other CP channels at ONLINE. */
 	schedule_work(&sm->boot_work);
 
 	return 0;
 
+err_cp2ap_irq:
+	free_irq(sm->cp2ap_irq, sm);
 err_rfs:
 	destroy_workqueue(sm->rfs_wq);
 err_wq:
 	destroy_workqueue(sm->pm_wq);
 err_irq:
+	if (sm->nvec > 1)
+		free_irq(pci_irq_vector(sm->pdev, 1), sm);
+err_irq0:
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 err_vectors:
 	pci_free_irq_vectors(sm->pdev);
@@ -4229,12 +5144,16 @@ err_rc:
 static void s5xxx_remove(struct platform_device *pdev)
 {
 	struct s5xxx_modem *sm = platform_get_drvdata(pdev);
+	int i;
+
+	debugfs_remove_recursive(sm->dbgfs);
 
 	/*
 	 * Quiesce runtime PM first: free_irq() stops new wakeup IRQs and waits for
 	 * the in-flight handler, so cancel_work_sync() then flushes the last relink
 	 * before the endpoint state it touches goes away.
 	 */
+	disable_irq_wake(sm->cp2ap_irq);
 	free_irq(sm->cp2ap_irq, sm);
 	if (sm->cp_active_irq >= 0)
 		free_irq(sm->cp_active_irq, sm);
@@ -4242,21 +5161,28 @@ static void s5xxx_remove(struct platform_device *pdev)
 	destroy_workqueue(sm->pm_wq);
 
 	cancel_work_sync(&sm->boot_work);
+	if (sm->nvec > 1)
+		free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	/* Main IRQ gone -> no more DL drains or RFS enqueues. */
-	if (sm->ndev)
-		unregister_netdev(sm->ndev);	/* needs_free_netdev frees it */
+	for (i = 0; i < S5XXX_PDP_CH_COUNT; i++)
+		if (sm->ndev[i])
+			unregister_netdev(sm->ndev[i]); /* needs_free_netdev frees it */
 	cancel_work_sync(&sm->rfs_work);
 	destroy_workqueue(sm->rfs_wq);
 	s5xxx_rfs_cleanup(sm);
+	if (sm->gnss_dump_port)
+		wwan_remove_port(sm->gnss_dump_port);
 	if (sm->gnss_port)
 		wwan_remove_port(sm->gnss_port);
-	if (sm->oem_port)
-		wwan_remove_port(sm->oem_port);
+	for (i = 0; i < S5XXX_OEM_PORTS; i++)
+		if (sm->oem[i].port)
+			wwan_remove_port(sm->oem[i].port);
 	if (sm->rfs_port)
 		wwan_remove_port(sm->rfs_port);
-	if (sm->ctrl_port)
-		wwan_remove_port(sm->ctrl_port);
+	for (i = 0; i < S5XXX_SIT_PORTS; i++)
+		if (sm->sit[i].port)
+			wwan_remove_port(sm->sit[i].port);
 	if (sm->at_port)
 		wwan_remove_port(sm->at_port);
 	release_firmware(sm->pbl);
@@ -4265,6 +5191,55 @@ static void s5xxx_remove(struct platform_device *pdev)
 	pci_dev_put(sm->pdev);
 	put_device(sm->rc_dev);
 }
+
+/*
+ * System sleep.  The CP has to be told, because it reads AP2CP_PDA_ACTIVE as
+ * the AP's liveness: left high while we are suspended it keeps addressing an AP
+ * and an HSI1 fabric that are gone, and drops out of ONLINE instead of waiting.
+ *
+ * Refuse to suspend while CP2AP_WAKEUP is high.  That means the CP still wants
+ * the PCIe link, and taking it away mid-transaction is how the control plane
+ * gets lost.  Downstream allows this during a tracked voice call, having an
+ * in-kernel notion of call state; there is none here, so reject every high
+ * level and let the suspend be retried once the CP parks.
+ */
+static int s5xxx_suspend_noirq(struct device *dev)
+{
+	struct s5xxx_modem *sm = dev_get_drvdata(dev);
+
+	if (gpiod_get_value(sm->cp2ap_wakeup)) {
+		dev_info(dev, "CP requests PCIe, aborting system suspend\n");
+		return -EBUSY;
+	}
+
+	s5xxx_publish_kernel_time(sm);
+	return zumapro_pcie_modem_set_ap_active(sm->rc_dev, false);
+}
+
+static int s5xxx_resume_noirq(struct device *dev)
+{
+	struct s5xxx_modem *sm = dev_get_drvdata(dev);
+
+	unsigned long flags;
+	int ret;
+
+	s5xxx_publish_kernel_time(sm);
+	ret = zumapro_pcie_modem_set_ap_active(sm->rc_dev, true);
+
+	/*
+	 * The work runs only once pm_wq thaws, i.e. after every device resume
+	 * callback has completed and the S2MPU is open again.
+	 */
+	spin_lock_irqsave(&sm->lock, flags);
+	sm->resume_recheck = true;
+	spin_unlock_irqrestore(&sm->lock, flags);
+	queue_work(sm->pm_wq, &sm->pm_work);
+
+	return ret;
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(s5xxx_pm_ops, s5xxx_suspend_noirq,
+			       s5xxx_resume_noirq);
 
 static const struct of_device_id s5xxx_of_match[] = {
 	{ .compatible = "samsung,s5300-modem", .data = &s5xxx_variant_s5300 },
@@ -4282,20 +5257,32 @@ MODULE_DEVICE_TABLE(of, s5xxx_of_match);
 static void s5xxx_shutdown(struct platform_device *pdev)
 {
 	struct s5xxx_modem *sm = platform_get_drvdata(pdev);
+	unsigned long flags;
+	int i;
 
 	if (!sm)
 		return;
 
-	/* Stop rmnet TX from ringing the doorbell on a link about to die. */
+	/*
+	 * Stop rmnet TX from ringing the doorbell on a link about to die.  Under
+	 * the transmit lock, so a transmit already inside ul_xmit finishes before
+	 * the gate closes rather than publishing into a ring nobody will drain.
+	 */
+	spin_lock_irqsave(&sm->tx_lock, flags);
 	sm->ul_active = false;
-	if (sm->ndev)
-		netif_tx_disable(sm->ndev);
+	spin_unlock_irqrestore(&sm->tx_lock, flags);
+	for (i = 0; i < S5XXX_PDP_CH_COUNT; i++)
+		if (sm->ndev[i])
+			netif_tx_disable(sm->ndev[i]);
 
+	disable_irq_wake(sm->cp2ap_irq);
 	free_irq(sm->cp2ap_irq, sm);
 	if (sm->cp_active_irq >= 0)
 		free_irq(sm->cp_active_irq, sm);
 	cancel_work_sync(&sm->pm_work);
 	cancel_work_sync(&sm->boot_work);
+	if (sm->nvec > 1)
+		free_irq(pci_irq_vector(sm->pdev, 1), sm);
 	free_irq(pci_irq_vector(sm->pdev, 0), sm);
 	cancel_work_sync(&sm->rfs_work);
 	dev_info(sm->dev, "quiesced for shutdown\n");
@@ -4308,6 +5295,7 @@ static struct platform_driver s5xxx_driver = {
 	.driver	= {
 		.name		= "s5xxx-modem",
 		.of_match_table	= s5xxx_of_match,
+		.pm		= pm_sleep_ptr(&s5xxx_pm_ops),
 	},
 };
 module_platform_driver(s5xxx_driver);

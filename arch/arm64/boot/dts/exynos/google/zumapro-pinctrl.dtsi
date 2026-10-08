@@ -1011,30 +1011,35 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 		gpp20: gpp20-gpio-bank {
 			gpio-controller;
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 		gpp21: gpp21-gpio-bank {
 			gpio-controller;
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 		gpp24: gpp24-gpio-bank {
 			gpio-controller;
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 		gpp22: gpp22-gpio-bank {
 			gpio-controller;
 			#gpio-cells = <2>;
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 		gpp23: gpp23-gpio-bank {
 			gpio-controller;
 			#gpio-cells = <2>;

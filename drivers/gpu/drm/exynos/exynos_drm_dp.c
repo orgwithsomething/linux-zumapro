@@ -21,11 +21,14 @@
 #include <drm/drm_atomic_helper.h>	/* drm_atomic_helperxxx */
 
 #include <drm/drm_edid.h>
+#include <linux/hdmi.h>
 #include <drm/display/drm_dp_helper.h>
 #include <drm/display/drm_dp_mst_helper.h>
 #include <drm/display/drm_dsc_helper.h>
 
 #include <drm/drm_of.h>
+#include <drm/drm_atomic_state_helper.h>
+#include <drm/drm_bridge_connector.h>
 #include <drm/drm_probe_helper.h>
 
 #include "exynos_drm_crtc.h"
@@ -57,12 +60,18 @@
 #define SYSTEM_CLK_CONTROL			(0x0008)
 #define GFMUX_STATUS_TXCLK			(0x03 << 8)
 #define GFMUX_STATUS_TXCLK_ON			(0x02)
-#define TXCLK_SEL				(0x01 << 5)
-#define TXCLK_SEL_MODE				(0x01 << 4)
+/*
+ * Both halves of the glitch-free mux, 0 selecting OSC and 1 the PHY's TX
+ * clock. Older DP links spelled these TXCLK_SEL and TXCLK_SEL_MODE.
+ */
+#define GFCLKMUX_SEL_10				(0x01 << 5)
+#define GFCLKMUX_SEL_20				(0x01 << 4)
+#define GFCLKMUX_SEL				(GFCLKMUX_SEL_10 | GFCLKMUX_SEL_20)
 #define OSC_CLK_SEL				(0x01 << 0)
 
-#define SYSTEM_MAIN_LINK_BANDWIDTH		(0x000C)
-#define LINK_BW_SET			        (0x1F << 0)
+/* 0x000C is the link bandwidth on older DP links, the OSC Q-channel here */
+#define SYSTEM_OSCLK_QCH_FUNCTION_ENABLE	(0x000C)
+#define OSCCLK_QCH_FUNC_EN			(0x01 << 0)
 
 #define SYSTEM_MAIN_LINK_LANE_COUNT		(0x0010)
 #define LANE_COUNT_SET			        (0x07 << 0)
@@ -109,6 +118,31 @@
 #define PLL_LOCK_STATUS				(0x01 << 4)
 #define PLL_LOCK_FORCE				(0x01 << 3)
 #define PLL_LOCK_FORCE_EN			(0x01 << 2)
+
+/* OSC clock dividers. _v is the DPOSC rate in MHz. */
+#define OSC_CLK_DIV_HPD				(0x0050)
+#define HPD_EVENT_CLK_COUNT			(0x7FFFF << 0)
+#define HPD_EVENT_CLK_COUNT_VAL(_v)		(((_v) * 2000) & 0x7FFFF)
+
+#define OSC_CLK_DIV_HDCP_10US			(0x0054)
+#define I2C_GEN10US_TIMER			(0xFFF << 0)
+#define I2C_GEN10US_TIMER_VAL(_v)		(((_v) * 10 - 1) & 0xFFF)
+
+#define OSC_CLK_DIV_GTC_1MS			(0x0058)
+#define GTC_1MS_OSC_CLK_COUNT			(0x3FFFF << 0)
+#define GTC_1MS_OSC_CLK_COUNT_VAL(_v)		(((_v) * 1000 - 1) & 0x3FFFF)
+
+#define OSC_CLK_DIV_AUX_1US			(0x005C)
+#define AUX_1US_OSC_CLK_COUNT			(0xFF << 0)
+#define AUX_1US_OSC_CLK_COUNT_VAL(_v)		(((_v) - 1) & 0xFF)
+
+#define OSC_CLK_DIV_AUX_MAN_UI			(0x0060)
+#define AUX_MAN_UI_OSC_CLK_COUNT		(0xFF << 0)
+#define AUX_MAN_UI_OSC_CLK_COUNT_VAL(_v)	((((_v) * 5 / 10) - 1) & 0xFF)
+
+#define OSC_CLK_DIV_AUX_10US			(0x0064)
+#define AUX_10US_OSC_CLK_COUNT			(0xFFF << 0)
+#define AUX_10US_OSC_CLK_COUNT_VAL(_v)		(((_v) * 10) & 0xFFF)
 
 #define SYSTEM_INTERRUPT_CONTROL		(0x0100)
 #define SW_INTR_CTRL				(0x01 << 1)
@@ -201,6 +235,8 @@
 #define AUX_BUF_DATA_COUNT			(0x7F << 24)
 #define AUX_DETECTED_PERIOD_MON			(0x1FF << 12)
 #define AUX_CMD_STATUS				(0x0F << 8)
+#define AUX_CMD_STATUS_GET(_v)			(((_v) >> 8) & 0x0F)
+#define AUX_CMD_STATUS_TIMEOUT_ERROR		(0x02)
 #define AUX_RX_COMM				(0x0F << 4)
 #define AUX_LAST_MODE				(0x01 << 3)
 #define AUX_BUSY				(0x01 << 2)
@@ -438,6 +474,12 @@
 
 #define PCS_TEST_PATTERN_SET2			(0x3014)
 #define TEST_80BIT_PATTERN_SET2			(0xFFFF << 0)
+
+/* The handshake with the Synopsys PHY. Samsung-PHY parts have no such block. */
+#define PCS_SNPS_PHY_DATAPATH_CONTROL		(0x3200)
+#define SNPS_TX_DATA_EN				(0x0F << 16)
+#define SNPS_TX_CLK_RDY				(0x0F << 8)
+#define SNPS_TX_CLK_EN				(0x0F << 0)
 
 #define PCS_DEBUG_CONTROL			(0x3018)
 #define FEC_FLIP_CDADJ_CODES_CASE4		(0x01 << 6)
@@ -1616,19 +1658,46 @@ int dp_regs_desc_init(u32 dp_id, struct dp_regs *regs)
 }
 void dp_reg_sw_reset(u32 id)
 {
-	u32 cnt = 10;
+	u32 cnt = 200;
 	u32 state;
 
 	dp_link_write_mask(id, SYSTEM_SW_RESET_CONTROL, ~0, SW_RESET);
+	udelay(1);
+	/* the bit does not self-clear; the CPU has to release it */
+	dp_link_write_mask(id, SYSTEM_SW_RESET_CONTROL, 0, SW_RESET);
 
 	do {
 		state = dp_link_read(id, SYSTEM_SW_RESET_CONTROL) & SW_RESET;
 		cnt--;
-		udelay(1);
+		udelay(10);
 	} while (state && cnt);
 
 	if (!cnt)
 		cal_log_err(id, "%s is timeout.\n", __func__);
+}
+
+static void dp_reg_set_oscclk_qch_func_en(u32 id, u32 en)
+{
+	dp_link_write_mask(id, SYSTEM_OSCLK_QCH_FUNCTION_ENABLE, en ? ~0 : 0,
+			   OSCCLK_QCH_FUNC_EN);
+}
+
+static void dp_reg_set_osc_clk_div(u32 id, u32 mhz)
+{
+	dp_link_write_mask(id, OSC_CLK_DIV_HPD, HPD_EVENT_CLK_COUNT_VAL(mhz),
+			   HPD_EVENT_CLK_COUNT);
+	dp_link_write_mask(id, OSC_CLK_DIV_HDCP_10US,
+			   I2C_GEN10US_TIMER_VAL(mhz), I2C_GEN10US_TIMER);
+	dp_link_write_mask(id, OSC_CLK_DIV_GTC_1MS,
+			   GTC_1MS_OSC_CLK_COUNT_VAL(mhz), GTC_1MS_OSC_CLK_COUNT);
+	dp_link_write_mask(id, OSC_CLK_DIV_AUX_1US,
+			   AUX_1US_OSC_CLK_COUNT_VAL(mhz), AUX_1US_OSC_CLK_COUNT);
+	dp_link_write_mask(id, OSC_CLK_DIV_AUX_MAN_UI,
+			   AUX_MAN_UI_OSC_CLK_COUNT_VAL(mhz),
+			   AUX_MAN_UI_OSC_CLK_COUNT);
+	dp_link_write_mask(id, OSC_CLK_DIV_AUX_10US,
+			   AUX_10US_OSC_CLK_COUNT_VAL(mhz),
+			   AUX_10US_OSC_CLK_COUNT);
 }
 void dp_reg_phy_reset(u32 id, u32 en)
 {
@@ -1657,34 +1726,29 @@ void dp_reg_phy_init_setting(u32 id)
 			  ANA_AUX_TX_LVL_CTRL);
 }
 
+/*
+ * The trained link rate, as last handed to dp_reg_phy_set_link_bw().
+ *
+ * It cannot be read back from the PHY here: CMN_REG00A3 is a Samsung DP PHY
+ * register, and this SoC pairs the link with a Synopsys combo PHY whose block
+ * is deliberately not mapped, so the read returns 0 and decodes as 1.62Gbps.
+ * That fed dp_reg_get_ls_clk() a link rate 1.667x too low, so NVID went to the
+ * sink as 162000 for a link actually running at 2.7Gbps and the recovered
+ * pixel clock was nonsense -- a trained link, symbols flowing, and a black
+ * screen.
+ */
+static u8 dp_link_bw[MAX_DP_CNT] = { LINK_RATE_2_7Gbps, LINK_RATE_2_7Gbps };
+
 u32 dp_reg_phy_get_link_bw(u32 id)
 {
-	u32 val = 0;
-
-	val = dp_phy_read_mask(id, CMN_REG00A3, DP_TX_LINK_BW) >> 5;
-
-	switch (val) {
-	case 0x03:
-		val = LINK_RATE_8_1Gbps;
-		break;
-	case 0x02:
-	default:
-		val = LINK_RATE_5_4Gbps;
-		break;
-	case 0x01:
-		val = LINK_RATE_2_7Gbps;
-		break;
-	case 0x00:
-		val = LINK_RATE_1_62Gbps;
-		break;
-	}
-
-	return val;
+	return dp_link_bw[id];
 }
 
 void dp_reg_phy_set_link_bw(u32 id, u8 link_rate)
 {
 	u32 val = 0;
+
+	dp_link_bw[id] = link_rate;
 
 	switch (link_rate) {
 	case LINK_RATE_8_1Gbps:
@@ -1793,6 +1857,12 @@ void dp_reg_set_training_pattern(u32 id, dp_training_pattern pattern)
 	dp_link_write_mask(id, PCS_CONTROL,
 			   LINK_TRAINING_PATTERN_SET_VAL(pattern),
 			   LINK_TRAINING_PATTERN_SET);
+
+	dp_link_write_mask(id, PCS_CONTROL, ~0, BIT_SWAP);
+
+	/* TPS1-3 must not be scrambled; real data and TPS4 must be. */
+	dp_reg_scrambling_enable(id, pattern == NORAMAL_DATA ||
+				     pattern == TRAINING_PATTERN_4);
 }
 
 void dp_reg_scrambling_enable(u32 id, bool enable)
@@ -2003,6 +2073,21 @@ void dp_reg_set_plug_interrupt(u32 id, u32 en)
 
 #define FIN_MHZ 24
 #define DEGLITCH_UDELAY 10
+
+/*
+ * There is no HPD wire on a USB-C connector: the sink's HPD arrives over VDMs
+ * and reaches us as a bridge notification. Drive the link's HPD input from
+ * that instead, which is what HPD_FORCE and host-controlled events are for.
+ * Without this SYSTEM_HPD_CONTROL.HPD_STATUS never asserts and every path
+ * that gates on it decides nothing is plugged in.
+ */
+static void dp_reg_set_hpd_force(u32 id, bool plugged)
+{
+	u32 val = HPD_FORCE_EN | HPD_EVENT_CTRL_EN | (plugged ? HPD_FORCE : 0);
+	u32 mask = HPD_FORCE_EN | HPD_EVENT_CTRL_EN | HPD_FORCE;
+
+	dp_link_write_mask(id, SYSTEM_HPD_CONTROL, val, mask);
+}
 
 u32 dp_reg_get_hpd_status(u32 id)
 {
@@ -2292,7 +2377,14 @@ static void dp_reg_set_video_clock(u32 id, u32 sst_id, u32 pixelclock)
 	stream_clk = pixelclock / 1000;
 	ls_clk = dp_reg_get_ls_clk(id) / 1000;
 
-	mvid_master = stream_clk >> 1;
+	/*
+	 * Halved again for the Synopsys combo PHY this SoC pairs the link with:
+	 * the vendor divides the stream clock by 4 here and notes it is the
+	 * PHY's requirement. The >> 1 this came with is the Samsung-PHY value,
+	 * and it puts MVID out twice too large, so the sink recovers a pixel
+	 * clock at double rate and shows nothing.
+	 */
+	mvid_master = stream_clk / 4;
 	nvid_master = ls_clk;
 
 	dp_link_write(id, SST1_MVID_MASTER_MODE + 0x1000 * sst_id, mvid_master);
@@ -2338,11 +2430,12 @@ static void dp_reg_set_active_symbol(u32 id, u32 sst_id, u32 pixelclock, u8 bpc)
 	clk = pixelclock / 1000;
 
 	bandwidth = dp_reg_get_ls_clk(id) / 1000;
-	if (dp_link_read(id, MST_ENABLE) & MST_EN)
-		lanecount =
-			MAX_LANE; /* In MST mode, number of lanes become 4 */
-	else
-		lanecount = dp_reg_get_lane_count(id);
+	/*
+	 * Not MST_ENABLE: that register does not exist on this IP and the read
+	 * returns whatever was last on the bus. An MST link trains to four
+	 * lanes anyway, so the lane count already says so.
+	 */
+	lanecount = dp_reg_get_lane_count(id);
 
 	TU_off = ((clk * bpp * 32) * 10000000000) / (lanecount * bandwidth * 8);
 	TU_on = (TU_off * 1000) / 976;
@@ -2381,17 +2474,24 @@ static void dp_reg_set_active_symbol(u32 id, u32 sst_id, u32 pixelclock, u8 bpc)
 		fraction_fec_off, ACTIVE_SYMBOL_FRACTION_FEC_OFF);
 	dp_link_write_mask(
 		id, SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_OFF + 0x1000 * sst_id,
-		threshold_fec_off, ACTIVE_SYMBOL_FRACTION_FEC_OFF);
+		threshold_fec_off, ACTIVE_SYMBOL_THRESHOLD_FEC_OFF);
+	/* Without the select, the threshold register above is ignored. */
+	dp_link_write_mask(
+		id, SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_OFF + 0x1000 * sst_id,
+		~0, ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_OFF);
 
 	dp_link_write_mask(id,
 			   SST1_ACTIVE_SYMBOL_INTEGER_FEC_ON + 0x1000 * sst_id,
 			   integer_fec_on, ACTIVE_SYMBOL_INTEGER_FEC_ON);
 	dp_link_write_mask(id,
 			   SST1_ACTIVE_SYMBOL_FRACTION_FEC_ON + 0x1000 * sst_id,
-			   fraction_fec_on, ACTIVE_SYMBOL_FRACTION_FEC_OFF);
+			   fraction_fec_on, ACTIVE_SYMBOL_FRACTION_FEC_ON);
 	dp_link_write_mask(
 		id, SST1_ACTIVE_SYMBOL_THRESHOLD_FEC_ON + 0x1000 * sst_id,
 		threshold_fec_on, ACTIVE_SYMBOL_THRESHOLD_FEC_ON);
+	dp_link_write_mask(
+		id, SST1_ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_ON + 0x1000 * sst_id,
+		~0, ACTIVE_SYMBOL_THRESHOLD_SEL_FEC_ON);
 }
 
 static void dp_reg_aux_ch_buf_clr(u32 id)
@@ -2490,7 +2590,20 @@ static int dp_reg_set_aux_ch_operation_enable(u32 id)
 			dp_link_read(id, AUX_REQUEST_CONTROL),
 			dp_link_read(id, AUX_COMMAND_CONTROL));
 
-		udelay(400);
+		/*
+		 * A sink that did not answer inside the 1.8ms reply window
+		 * needs 1.4ms before it is asked again; the vendor waits that
+		 * long for a timeout and keeps the shorter 400us for every
+		 * other error. Retrying a slow sink every 400us only burns the
+		 * retry count, which is what the XReal glasses hit -- every
+		 * DPCD read failing on a port where a quicker adapter works.
+		 */
+		if (AUX_CMD_STATUS_GET(val0) == AUX_CMD_STATUS_TIMEOUT_ERROR) {
+			usleep_range(1400, 1410);
+			return -ETIME;
+		}
+
+		usleep_range(400, 410);
 		return -EIO;
 	}
 
@@ -2624,6 +2737,89 @@ static void dp_reg_set_lane_map_config(u32 id)
 	dp_reg_set_lane_map(id, 0, 1, 2, 3);
 }
 
+void dp_reg_set_txclk(u32 id, bool from_phy)
+{
+	dp_link_write_mask(id, SYSTEM_CLK_CONTROL, from_phy ? ~0 : 0,
+			   GFCLKMUX_SEL);
+}
+
+u32 dp_reg_get_gfmux_status(u32 id)
+{
+	return dp_link_read_mask(id, SYSTEM_CLK_CONTROL, GFMUX_STATUS_TXCLK) >> 8;
+}
+
+void dp_reg_set_snps_tx_clk(u32 id, u8 lane_cnt)
+{
+	u32 mask = lane_cnt ? GENMASK(lane_cnt - 1, 0) : 0;
+
+	dp_link_write_mask(id, PCS_SNPS_PHY_DATAPATH_CONTROL, mask << 8,
+			   SNPS_TX_CLK_RDY);
+	dp_link_write_mask(id, PCS_SNPS_PHY_DATAPATH_CONTROL, mask,
+			   SNPS_TX_CLK_EN);
+}
+
+void dp_reg_set_snps_tx_data_en(u32 id, u8 lane_cnt)
+{
+	u32 mask = lane_cnt ? GENMASK(lane_cnt - 1, 0) : 0;
+
+	dp_link_write_mask(id, PCS_SNPS_PHY_DATAPATH_CONTROL, mask << 16,
+			   SNPS_TX_DATA_EN);
+}
+
+static void dp_reg_set_infoframe_data(u32 id, u32 offset, const u8 *data,
+				      u32 len)
+{
+	u32 word, i;
+
+	for (i = 0; i < len; i += 4) {
+		word = data[i];
+		if (i + 1 < len)
+			word |= data[i + 1] << 8;
+		if (i + 2 < len)
+			word |= data[i + 2] << 16;
+		if (i + 3 < len)
+			word |= data[i + 3] << 24;
+
+		dp_link_write(id, offset + i, word);
+	}
+}
+
+/*
+ * The vendor sends both of these on every enable, between the video config and
+ * VIDEO_EN. A sink bridging DP to HDMI builds its outgoing AVI InfoFrame from
+ * ours, and will not produce an output without one.
+ */
+static void dp_reg_send_avi_infoframe(u32 id, u32 sst_id, const u8 *data,
+				      u32 len)
+{
+	u32 offset = 0x1000 * sst_id;
+
+	dp_reg_set_infoframe_data(id, SST1_INFOFRAME_AVI_PACKET_DATA_SET0 +
+				  offset, data, len);
+	dp_link_write_mask(id, SST1_INFOFRAME_UPDATE_CONTROL + offset, ~0,
+			   AVI_INFO_UPDATE);
+	dp_link_write_mask(id, SST1_INFOFRAME_SEND_CONTROL + offset, ~0,
+			   AVI_INFO_SEND);
+}
+
+static void dp_reg_send_spd_infoframe(u32 id, u32 sst_id)
+{
+	u32 offset = 0x1000 * sst_id;
+	u8 data[SPD_INFOFRAME_LENGTH] = { 0 };
+
+	memcpy(&data[0], "Google", 6);	/* vendor name, bytes 1-8 */
+	memcpy(&data[8], "Pixel", 5);	/* product description, bytes 9-24 */
+
+	dp_link_write_mask(id, SST1_INFOFRAME_SPD_PACKET_TYPE + offset,
+			   INFOFRAME_PACKET_TYPE_SPD, SPD_TYPE);
+	dp_reg_set_infoframe_data(id, SST1_INFOFRAME_SPD_PACKET_DATA_SET0 +
+				  offset, data, sizeof(data));
+	dp_link_write_mask(id, SST1_INFOFRAME_UPDATE_CONTROL + offset, ~0,
+			   SPD_INFO_UPDATE);
+	dp_link_write_mask(id, SST1_INFOFRAME_SEND_CONTROL + offset, ~0,
+			   SPD_INFO_SEND);
+}
+
 static void dp_reg_lh_p_ch_power(u32 id, u32 sst_id, u32 en)
 {
 	u32 cnt = 20 * 1000; /* wait 1ms */
@@ -2650,19 +2846,22 @@ static void dp_reg_lh_p_ch_power(u32 id, u32 sst_id, u32 en)
 
 	dp_link_write_mask(id, reg_offset, val, SST1_LH_PWR_ON);
 
+	/*
+	 * cal_read_mask() does not shift, so the status reads back as 0 or
+	 * SST1_LH_PWR_ON_STATUS, never as 1. Comparing it against @en directly
+	 * never matched, so this always ran the full count and then reported
+	 * nothing: the error test below was inverted too, firing only when the
+	 * channel *had* come up on the last iteration. The pixel channel has
+	 * never actually been confirmed powered.
+	 */
 	do {
-		state = dp_link_read_mask(id, reg_offset,
-					  SST1_LH_PWR_ON_STATUS);
+		state = !!dp_link_read_mask(id, reg_offset,
+					    SST1_LH_PWR_ON_STATUS);
 		cnt--;
 		udelay(1);
 	} while ((en ^ state) && cnt);
-	/*
-	 * en xor state
-	 * if (en), do while (!state) = en(1), state(0)
-	 * else, do while(state) = en(0), state(1)
-	 */
 
-	if (!(en ^ state) && !cnt) {
+	if ((en ^ state) && !cnt) {
 		cal_log_err(id, "%s on is timeout[%d].\n", __func__, state);
 		cal_log_err(id, "SYSTEM_CLK_CONTROL[0x%08x]\n",
 			    dp_link_read(id, SYSTEM_CLK_CONTROL));
@@ -2756,7 +2955,11 @@ static void dp_reg_phy_init(u32 id)
 	dp_reg_phy_mode_setting(id);
 	dp_reg_phy_ssc_enable(id, 0);
 	dp_reg_phy_reset(id, 0);
-	dp_reg_wait_phy_pll_lock(id);
+	/*
+	 * No PLL lock to wait for here: everything above writes the Samsung PHY
+	 * block, which is unmapped on this SoC. The Synopsys MPLLB is programmed
+	 * from link training, and that is where the lock is waited on.
+	 */
 }
 
 void dp_reg_phy_disable(u32 id)
@@ -2875,9 +3078,14 @@ void dp_reg_start(u32 id, u32 sst_id)
 	dp_reg_set_sst_stream_enable(id, sst_id, 1);
 	dp_reg_set_sst_interrupt_mask(id, sst_id, VIDEO_FIFO_UNDER_FLOW_MASK,
 				      0);
+	/*
+	 * Long-hop pixel channel first, and only then video: the vendor's
+	 * dp_hw_start() powers it up, waits for it, and treats a failure as
+	 * fatal before it sets VIDEO_EN.
+	 */
+	dp_reg_lh_p_ch_power(id, sst_id, 1);
 	dp_link_write_mask(id, SST1_VIDEO_ENABLE + 0x1000 * sst_id, 1,
 			   VIDEO_EN);
-	dp_reg_lh_p_ch_power(id, sst_id, 1);
 }
 
 static void dp_reg_wait_vsync_interrupt_status(u32 id, u32 sst_id)
@@ -3230,6 +3438,9 @@ void exynos_drm_dp_set_normal_data(struct exynos_dp_subdev *dp)
 	dp_reg_scrambling_enable(dp->id, 1);
 }
 
+static int exynos_drm_dp_start(struct exynos_dp_subdev *dp);
+static void exynos_drm_dp_stop(struct exynos_dp_subdev *dp);
+
 static void exynos_drm_dp_hpd_changed(struct exynos_dp_subdev *dp, int state)
 {
 	struct device *dev = dp->dev;
@@ -3247,10 +3458,20 @@ static void exynos_drm_dp_hpd_changed(struct exynos_dp_subdev *dp, int state)
 
 	dp_log_info(dev, "hpd state cur:%d -> new:%d\n", dp->hpd_state, state);
 
-	disable_irq(dp->hpd_gpio_irq);
 	if (state) {
 		dp->hpd_state = HPD_CHECK;
 		if (!dp->training_state) {
+			/*
+			 * Nothing has touched the link block yet: the bind-time
+			 * start() returns early while no sink is attached, so
+			 * the soft reset, the common function enables and the
+			 * PHY's AUX power all still have to happen -- before
+			 * the first DPCD read, which is what AUX carries.
+			 */
+			ret = exynos_drm_dp_start(dp);
+			if (ret < 0)
+				goto HPD_FAIL;
+
 			ret = exynos_drm_dp_link_training(dp);
 			if (ret < 0)
 				goto HPD_FAIL;
@@ -3262,22 +3483,24 @@ static void exynos_drm_dp_hpd_changed(struct exynos_dp_subdev *dp, int state)
 			dp->detect(dev);
 	} else {
 		dp->hpd_state = HPD_UNPLUG;
+		exynos_drm_dp_stop(dp);
 		dp->training_state = false;
+		/* so the next plug runs start() again rather than skipping it */
+		dp->state = DP_STATE_OFF;
 
 		if (dp->detect)
 			dp->detect(dev);
 	}
 
 	dp_log_info(dp->dev, "hpd state goto %s\n", state ? "plug" : "unplug");
-	enable_irq(dp->hpd_gpio_irq);
 	return;
 
 HPD_FAIL:
 	dp_log_err(dev, "link training is failed\n");
+	exynos_drm_dp_stop(dp);
 	dp->training_state = false;
 	dp->hpd_state = HPD_LT_FAILED;
 
-	enable_irq(dp->hpd_gpio_irq);
 	return;
 }
 
@@ -3287,7 +3510,6 @@ static irqreturn_t exynos_drm_dp_irq(int irq, void *dev_id)
 	struct device *dev = dp->dev;
 	u32 irq_type = 0, val;
 	int i = 0;
-	bool valid_gpio = !!dp->hpd_gpio;
 	unsigned long flags;
 
 	spin_lock_irqsave(&dp->slock, flags);
@@ -3295,30 +3517,22 @@ static irqreturn_t exynos_drm_dp_irq(int irq, void *dev_id)
 	/* common interrupt */
 	irq_type = dp_reg_get_int_and_clear(dp->id, DP_IRQ_REG_SYSTEM);
 
-	/* The priority for PLUG and UNPLUG behavior is HPD_GPIO than DPTX_IRQ.*/
-	if (!valid_gpio) {
-		if (irq_type & DP_IRQ_HPD_CHG)
-			dp_log_dbg(dev, "HPD_CHG detect\n");
+	if (irq_type & DP_IRQ_HPD_CHG)
+		dp_log_dbg(dev, "HPD_CHG detect\n");
 
-		if (irq_type & DP_IRQ_HPD_PLUG_INT) {
-			queue_delayed_work(dp->dp_wq, &dp->hpd_plug_work, 0);
-			dp_log_info(dev, "HPD_PLUG detect\n");
-		}
-	} else {
-		if (irq_type & DP_IRQ_HPD_LOST) {
-			queue_delayed_work(dp->dp_wq, &dp->hpd_unplug_work, 0);
-			dp_log_info(dev, "HPD_LOST detect\n");
-		}
+	if (irq_type & DP_IRQ_HPD_LOST) {
+		queue_delayed_work(dp->dp_wq, &dp->hpd_unplug_work, 0);
+		dp_log_info(dev, "HPD_LOST detect\n");
+	}
 
-		if (irq_type & DP_IRQ_HPD_IRQ_FLAG) {
-			queue_delayed_work(dp->dp_wq, &dp->hpd_irq_work, 0);
-			dp_log_info(dev, "HPD_IRQ detect\n");
-		}
+	if (irq_type & DP_IRQ_HPD_IRQ_FLAG) {
+		queue_delayed_work(dp->dp_wq, &dp->hpd_irq_work, 0);
+		dp_log_info(dev, "HPD_IRQ detect\n");
+	}
 
-		if (irq_type & DP_IRQ_HPD_PLUG_INT) {
-			queue_delayed_work(dp->dp_wq, &dp->hpd_plug_work, 0);
-			dp_log_info(dev, "HPD_PLUG detect\n");
-		}
+	if (irq_type & DP_IRQ_HPD_PLUG_INT) {
+		queue_delayed_work(dp->dp_wq, &dp->hpd_plug_work, 0);
+		dp_log_info(dev, "HPD_PLUG detect\n");
 	}
 
 	if (irq_type)
@@ -3333,24 +3547,6 @@ static irqreturn_t exynos_drm_dp_irq(int irq, void *dev_id)
 					i + 1, val);
 	}
 
-	spin_unlock_irqrestore(&dp->slock, flags);
-
-	return IRQ_HANDLED;
-}
-
-static irqreturn_t exynos_drm_dp_hpd_gpio_irq_thread(int irq, void *dev_id)
-{
-	struct exynos_dp_subdev *dp = dev_id;
-	struct device *dev = dp->dev;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dp->slock, flags);
-
-	if ((gpiod_get_value(dp->hpd_gpio) == HPD_PLUG) &&
-	    dp->hpd_state == HPD_UNPLUG) {
-		queue_delayed_work(dp->dp_wq, &dp->hpd_plug_work, 0);
-		dp_log_info(dev, "GPIO_HPD_PLUG detect\n");
-	}
 	spin_unlock_irqrestore(&dp->slock, flags);
 
 	return IRQ_HANDLED;
@@ -3446,16 +3642,21 @@ static int exynos_drm_dp_init_resources(struct exynos_dp_subdev *dp, struct plat
 		return PTR_ERR(dp->regs.link_addr);
 	}
 
+	/*
+	 * Optional. The dp_phy_* register layer here is the Samsung DP PHY
+	 * (CMN_REG/TRSV_REG); zuma pairs this link with a Synopsys combo PHY
+	 * whose registers look nothing like it and which phy-exynos5-usbdrd
+	 * owns. Left unmapped there, which makes every dp_phy_* access a
+	 * no-op, and the PHY is driven through phy_power_on() instead.
+	 */
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "phy_base");
-	if (res == NULL) {
-		dp_log_err(dev, "failed to find dp phy memory resource for dp\n");
-		return -EINVAL;
-	}
-	dp->regs.phy_addr = devm_ioremap_resource(dp->dev, res);
+	if (res) {
+		dp->regs.phy_addr = devm_ioremap_resource(dp->dev, res);
 
-	if (IS_ERR(dp->regs.phy_addr)) {
-		dp_log_err(dev, "failed to remap io region\n");
-		return PTR_ERR(dp->regs.phy_addr);
+		if (IS_ERR(dp->regs.phy_addr)) {
+			dp_log_err(dev, "failed to remap io region\n");
+			return PTR_ERR(dp->regs.phy_addr);
+		}
 	}
 
 	dp_regs_desc_init(dp->id, &dp->regs);
@@ -3715,30 +3916,6 @@ static int exynos_drm_dp_subdev_probe(u32 id, struct device *dev,
 
 	spin_lock_init(&dp->slock);
 
-	dp->hpd_gpio = devm_gpiod_get_optional(dp->dev, "hpd", GPIOD_IN);
-	if (IS_ERR(dp->hpd_gpio)) {
-		ret = dev_err_probe(dev, PTR_ERR(dp->hpd_gpio),
-				    "failed to get HPD GPIO\n");
-		goto err_devm_alloc;
-	}
-
-	if (dp->hpd_gpio) {
-		dp->hpd_gpio_irq = gpiod_to_irq(dp->hpd_gpio);
-
-		dp_log_dbg(dev, "GPIO_HPD has been registered. irq(%d)\n",
-			   dp->hpd_gpio_irq);
-
-		irq_set_status_flags(dp->hpd_gpio_irq, IRQ_NOAUTOEN);
-		ret = devm_request_threaded_irq(dp->dev, dp->hpd_gpio_irq,
-					NULL, exynos_drm_dp_hpd_gpio_irq_thread,
-					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
-					dev_name(dp->dev), dp);
-		if (ret) {
-			dp_log_err(dev, "failed to request dp hpd_gpio_irq\n");
-			goto err_devm_alloc;
-		}
-	}
-
 	dp->irq = platform_get_irq(pdev, 0);
 	if (dp->irq < 0) {
 		dp_log_err(dev, "failed to request dp irq resource\n");
@@ -3918,6 +4095,11 @@ void exynos_drm_dp_stream_enable(struct exynos_dp_subdev *dp, dp_sst_idx_t sst_i
 	else
 		dp_reg_set_video_config(dp->id, dp_video_info);
 
+	if (vi->avi_len)
+		dp_reg_send_avi_infoframe(dp->id, vi->sst_id, vi->avi_data,
+					  vi->avi_len);
+	dp_reg_send_spd_infoframe(dp->id, vi->sst_id);
+
 	dp_reg_start(dp->id, vi->sst_id);
 
 	exynos_drm_dp_set_normal_data(dp);
@@ -3962,7 +4144,7 @@ bool exynos_drm_dp_is_hpd_connected(struct exynos_dp_subdev *dp)
 	int old_hpd = dp->hpd_state;
 
 	mutex_lock(&dp->lock);
-	if (gpiod_get_value(dp->hpd_gpio)) {
+	if (dp_reg_get_hpd_status(dp->id)) {
 		mutex_unlock(&dp->lock);
 		if (dp->state == DP_STATE_LINKED)
 			exynos_drm_dp_hpd_en(dp);
@@ -4013,8 +4195,9 @@ static int exynos_drm_dp_start(struct exynos_dp_subdev *dp)
 	int ret = 0;
 
 	dp_log_info(dev, "+, state: %d\n", dp->state);
-	if (gpiod_get_value(dp->hpd_gpio) == HPD_UNPLUG) {
-		dp_log_err(dev, "DP(%d) is unplug\n", dp->id);
+
+	if (!dp->oob_plugged) {
+		dp_log_info(dev, "DP(%d) has no sink attached\n", dp->id);
 		return 0;
 	}
 
@@ -4024,6 +4207,9 @@ static int exynos_drm_dp_start(struct exynos_dp_subdev *dp)
 	}
 	mutex_lock(&dp->pwlock);
 
+	ret = phy_set_mode(dp->phy, PHY_MODE_DP);
+	if (ret < 0)
+		dp_log_err(dev, "cannot put the phy in DP mode, %d\n", ret);
 	ret = phy_power_on(dp->phy);
 	if (ret < 0) {
 		dp_log_err(dev, "cannot enable DP_PHY[%d], %d\n", dp->id, ret);
@@ -4032,14 +4218,18 @@ static int exynos_drm_dp_start(struct exynos_dp_subdev *dp)
 	}
 
 	dp_reg_sw_reset(dp->id);
+	dp_reg_set_oscclk_qch_func_en(dp->id, 1);
+	dp_reg_set_osc_clk_div(dp->id, dp->osc_mhz);
+	dp_reg_set_txclk(dp->id, false);
 	dp_reg_init(dp->id);
+	/* the soft reset wipes SYSTEM_HPD_CONTROL, so re-assert the force */
+	dp_reg_set_hpd_force(dp->id, dp->oob_plugged);
 
 	dp_reg_set_hpd_interrupt(dp->id, 1);
 
 	dp->training_state = false;
 
 	enable_irq(dp->irq);
-	disable_irq(dp->hpd_gpio_irq);
 
 	dp->state = DP_STATE_LINKED;
 
@@ -4048,6 +4238,43 @@ static int exynos_drm_dp_start(struct exynos_dp_subdev *dp)
 	dp_log_info(dev, "-, state: %d\n", dp->state);
 
 	return ret;
+}
+
+/*
+ * Give the lanes back. Without this the link stays on the PHY's TX clock with
+ * the data path enabled and the PHY still holding the lanes, so the TCA never
+ * sees them released and the next Type-C connect cannot be muxed at all.
+ * Mirrors the vendor's dp_hw_deinit().
+ */
+static void exynos_drm_dp_stop(struct exynos_dp_subdev *dp)
+{
+	struct device *dev = dp->dev;
+
+	mutex_lock(&dp->pwlock);
+
+	if (dp->state != DP_STATE_LINKED) {
+		mutex_unlock(&dp->pwlock);
+		return;
+	}
+
+	dp_log_info(dev, "+, state: %d\n", dp->state);
+
+	disable_irq(dp->irq);
+
+	dp_reg_set_snps_tx_data_en(dp->id, 0);
+	dp_reg_set_snps_tx_clk(dp->id, 0);
+	dp_reg_deinit(dp->id);
+	dp_reg_set_txclk(dp->id, false);
+	dp_reg_set_oscclk_qch_func_en(dp->id, 0);
+
+	/* parks the lanes and re-asserts DPALT_DISABLE_ACK for the TCA */
+	phy_set_mode(dp->phy, PHY_MODE_INVALID);
+	phy_power_off(dp->phy);
+
+	dp->state = DP_STATE_OFF;
+	dp->training_state = false;
+
+	mutex_unlock(&dp->pwlock);
 }
 
 /*
@@ -4310,16 +4537,54 @@ static void exynos_drm_dp_disable(struct drm_encoder *encoder)
 }
 
 void exynos_drm_dp_to_videoinfo(struct drm_encoder *encoder,
-		struct drm_display_mode *mode,
+		const struct drm_display_mode *mode,
 		struct exynos_dp_video_info *vi)
 {
 	struct exynos_drm_dp *dp = encoder_to_dp(encoder);
 	struct device *dev = dp->dev;
-	struct dp_encoder *dp_encoder = to_encoder(encoder);
-	struct drm_display_info *dp_info =
-				&dp_encoder->dp_connector->base.display_info;
+	/*
+	 * The connector is drm_bridge_connector_init()'s, held in dp->connector.
+	 * The vendor's dp_encoder->dp_connector is never populated on this path
+	 * and dereferencing it faults during the first modeset.
+	 */
+	struct drm_display_info *dp_info = &dp->connector->display_info;
+
+	struct hdmi_avi_infoframe frame;
+	u8 buf[HDMI_INFOFRAME_SIZE(AVI)];
+	int ret;
 
 	memset(vi, 0x0, sizeof(*vi));
+
+	/*
+	 * Pack the AVI InfoFrame here, where the mode and the connector are
+	 * both in hand; stream enable only writes it out. A DP-to-HDMI bridge
+	 * needs it to build its downstream output.
+	 */
+	ret = drm_hdmi_avi_infoframe_from_display_mode(&frame, dp->connector,
+						       mode);
+	if (ret < 0) {
+		dp_log_err(dev, "failed to set up AVI infoframe: %d\n", ret);
+	} else {
+		/* Not every mode matches a CEA VIC, and then this comes back
+		 * unset; the sink still wants a sane aspect ratio.
+		 */
+		if (frame.picture_aspect == HDMI_PICTURE_ASPECT_NONE) {
+			if (mode->hdisplay == mode->vdisplay * 16 / 9)
+				frame.picture_aspect = HDMI_PICTURE_ASPECT_16_9;
+			else if (mode->hdisplay == mode->vdisplay * 4 / 3)
+				frame.picture_aspect = HDMI_PICTURE_ASPECT_4_3;
+		}
+
+		ret = hdmi_avi_infoframe_pack(&frame, buf, sizeof(buf));
+		if (ret < 0) {
+			dp_log_err(dev, "failed to pack AVI infoframe: %d\n",
+				   ret);
+		} else {
+			/* buf[3] is the checksum, which the hardware fills in */
+			vi->avi_len = min_t(u8, buf[2], MAX_INFOFRAME_LENGTH);
+			memcpy(vi->avi_data, &buf[4], vi->avi_len);
+		}
+	}
 
 	drm_display_mode_to_videomode(mode, &vi->vm);
 	vi->vrefresh = drm_mode_vrefresh(mode);
@@ -4353,8 +4618,8 @@ void exynos_drm_dp_to_videoinfo(struct drm_encoder *encoder,
 }
 
 static void exynos_drm_dp_mode_set(struct drm_encoder *encoder,
-		struct drm_display_mode *mode,
-		struct drm_display_mode *adjusted_mode)
+		const struct drm_display_mode *mode,
+		const struct drm_display_mode *adjusted_mode)
 {
 	struct exynos_drm_dp *dp = encoder_to_dp(encoder);
 	struct exynos_dp_subdev *subdev = dp->subdev;
@@ -4374,227 +4639,10 @@ static void exynos_drm_dp_mode_set(struct drm_encoder *encoder,
 			vi.dsc.enable ? "compression" : "bypass");
 }
 
-static bool exynos_drm_dp_connector_set_link_status(struct drm_device *dev,
-		struct exynos_drm_dp *dp)
-{
-	struct drm_connector *connector;
-	struct drm_connector_list_iter conn_iter;
-	struct exynos_dp_subdev *subdev = dp->subdev;
-	struct exynos_drm_dp *drm_dp;
-	struct dp_connector *dp_connector;
-	enum drm_link_status set_link_status = DRM_LINK_STATUS_GOOD;
-	enum drm_link_status old_link_status;
-	int max_link_rate = 0;
-	int root_id = dp->connector->base.id;
-	bool changed = false;
-
-	if (subdev->dpcd[DP_MAX_LINK_RATE])
-		max_link_rate =	subdev->dpcd[DP_MAX_LINK_RATE];
-
-	if ((subdev->hpd_state) &&
-		((max_link_rate != subdev->lt_info.link_rate) || !subdev->training_state))
-		set_link_status = DRM_LINK_STATUS_BAD;
-
-	drm_connector_list_iter_begin(dev, &conn_iter);
-
-	drm_for_each_connector_iter(connector, &conn_iter) {
-		if (connector->connector_type != DRM_MODE_CONNECTOR_DisplayPort)
-			continue;
-
-		if (IS_ERR_OR_NULL(connector->state))
-			continue;
-
-		drm_dp = connector_to_dp(connector);
-		if (drm_dp->output_type != dp->output_type)
-			continue;
-
-		/* This is case of DP UNPLUG */
-		if (set_link_status == DRM_LINK_STATUS_GOOD)
-			goto CHECK_LINK_STATUS;
-
-		/* pdt = peer-device-type
-		 * link_status is controled sink device in mst mode.
-		 * pdt = 0 (no device connected
-		 * ptd = 1 (Source device or SST branch device to UFP)
-		 * pdt = 2 (Device with MST branch or SST branch device to DFP)
-		 * pdt = 3 (SST Sink device or stream sink in MST)
-		 * pdt = 4 (DP-to-Legacy converter)
-		 */
-		dp_connector = to_connector(connector);
-		if (dp->is_mst && (!dp_connector->port ||
-					(dp_connector->port->pdt < DP_PEER_DEVICE_SST_SINK)))
-			continue;
-
-		if (!dp->is_mst && (connector->base.id != root_id))
-			continue;
-
-CHECK_LINK_STATUS:
-		old_link_status = connector->state->link_status;
-
-		if (set_link_status != old_link_status) {
-			dp_log_kms(dp->dev, "[CONNECTOR:%d:%s] link_status changed(%d) -> (%d)\n",
-					connector->base.id, connector->name,
-					old_link_status, set_link_status);
-			connector->state->link_status = set_link_status;
-			changed = true;
-		}
-	}
-
-	drm_connector_list_iter_end(&conn_iter);
-
-	return changed;
-}
 
 /*** connector functions ***/
-static enum drm_connector_status
-exynos_drm_dp_connector_detect(struct drm_connector *connector, bool force)
-{
-	enum drm_connector_status status = connector_status_disconnected;
-	enum drm_connector_status old_status = connector->status;
-	struct exynos_drm_dp *dp = connector_to_dp(connector);
-	struct drm_device *drm_dev = dp->drm_dev;
-	struct device *dev = dp->dev;
-	bool link_status_changed = false;
 
-	dp_log_kms(dev, "\n");
 
-	if (exynos_drm_dp_is_hpd_connected(dp->subdev))
-		status = connector_status_connected;
-
-	/* In case of MST, SST connector should be disconnected */
-	if (dp->is_mst)
-		status = connector_status_disconnected;
-
-	link_status_changed =
-		exynos_drm_dp_connector_set_link_status(drm_dev, dp);
-
-	if ((status == old_status) && link_status_changed)
-		drm_kms_helper_hotplug_event(dp->drm_dev);
-
-	dp_log_kms(dev, "status is %s\n",
-			status == connector_status_connected ? \
-			"connected" : "disconnected");
-	return status;
-};
-
-/* If native only is true, only native mode is used */
-#define for_each_dt_timings(num_timings, native_only, native_mode, __i) \
-	for ((__i) = (native_only) ? (native_mode) : 0; 		\
-	     (__i) < (num_timings) && 					\
-		     (!(native_only) || (__i) == (native_mode));	\
-	     (__i)++)	\
-
-static int exynos_drm_dp_add_mode_from_dt(struct drm_connector *connector,
-					  struct display_timings *timings)
-{
-	struct dp_connector *dp_connector = to_connector(connector);
-	struct drm_device *drm_dev = connector->dev;
-	struct videomode vm;
-	struct drm_display_mode *mode;
-	int native_mode;
-	bool native_only;
-	int mode_num = 0;
-	int index;
-
-	if (!timings)
-		return mode_num;
-
-	/* Check a out of timings->num_timings */
-	native_mode = dp_connector->native_mode;
-	if (native_mode < 0 || native_mode >= timings->num_timings)
-		native_mode = timings->native_mode;
-
-	native_only = dp_connector->native_only;
-
-	for_each_dt_timings(timings->num_timings, native_only, native_mode, index) {
-		if (videomode_from_timings(timings, &vm, index)) {
-			dp_log_err(drm_dev->dev, "index(%d) is invalid\n",
-					index);
-			continue;
-		}
-
-		mode = drm_mode_create(drm_dev);
-		if (!mode) {
-			dp_log_err(drm_dev->dev, "failed to add mode %ux%u\n",
-					vm.hactive, vm.vactive);
-			continue;
-		}
-
-		drm_display_mode_from_videomode(&vm, mode);
-
-		mode->type = DRM_MODE_TYPE_DRIVER;
-
-		if (index == native_mode)
-			mode->type |= DRM_MODE_TYPE_PREFERRED;
-
-		dp_log_dbg(drm_dev->dev, "%s, vrefresh(%d), pclock(%d khz)\n",
-				mode->name, drm_mode_vrefresh(mode), mode->clock);
-
-		drm_mode_probed_add(connector, mode);
-		mode_num++;
-	}
-
-	return mode_num;
-}
-
-int exynos_drm_dp_add_timings(struct exynos_drm_dp *dp,
-		struct drm_connector *connector)
-{
-	struct display_timings *timings = dp->timings;
-	struct device *dev = dp->dev;
-	int num_modes;
-
-	num_modes = exynos_drm_dp_add_mode_from_dt(connector, timings);
-	if (!num_modes)
-		dp_log_dbg(dev, "failed to get modes from device tree");
-
-	return num_modes;
-}
-
-static int exynos_drm_dp_get_modes(struct drm_connector *connector)
-{
-	struct exynos_drm_dp *dp = connector_to_dp(connector);
-	struct exynos_dp_subdev *subdev = dp->subdev;
-	struct device *dev = dp->dev;
-	struct edid *edid = NULL;
-	int num_modes = 0;
-	u8 support_edid;
-
-	num_modes = exynos_drm_dp_add_timings(dp, connector);
-	if (num_modes)
-		goto ret;
-
-	drm_dp_dpcd_readb(&subdev->aux, DP_RECEIVE_PORT_0_CAP_0, &support_edid);
-
-	if (support_edid & DP_LOCAL_EDID_PRESENT)
-		edid = drm_get_edid(connector, &subdev->aux.ddc);
-
-	if (edid) {
-		drm_connector_update_edid_property(connector, edid);
-		num_modes = drm_add_edid_modes(connector, edid);
-		kfree(edid);
-	}
-
-ret:
-	dp_log_kms(dev, "num_modes %d\n", num_modes);
-	return num_modes;
-}
-
-static enum drm_mode_status
-exynos_drm_dp_mode_valid(struct drm_connector *connector,
-			 const struct drm_display_mode *mode)
-{
-	struct exynos_drm_dp *dp = connector_to_dp(connector);
-	struct device *dev = dp->dev;
-
-	dp_log_kms(dev, "hdisplay=%d, vdisplay=%d, vrefresh=%d, clock=%d\n",
-		mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode),
-		mode->clock * 1000);
-
-	/* TODO: return MODE_BAD if exynos_dp_drv can't support it */
-
-	return MODE_OK;
-}
 
 static void exynos_drm_dp_destroy_encoder(struct drm_encoder *encoder)
 {
@@ -4608,43 +4656,140 @@ static void exynos_drm_dp_destroy_encoder(struct drm_encoder *encoder)
 	kfree(dp_encoder);
 }
 
-static void exynos_drm_dp_destroy_connector(struct drm_connector *connector)
-{
-	struct dp_connector *dp_connector = to_connector(connector);
-	struct exynos_drm_dp *dp = connector_to_dp(connector);
-	struct device *dev = dp->dev;
-
-	dp_log_kms(dev, "connector %d\n", connector->base.id);
-	drm_connector_cleanup(connector);
-	kfree(dp_connector);
-}
 
 static const struct drm_encoder_funcs exynos_drm_dp_encoder_funcs = {
 	.destroy = exynos_drm_dp_destroy_encoder,
 };
 
+/* enable/disable/mode_set live on the bridge; the encoder is just the pipe. */
 static const struct drm_encoder_helper_funcs
 exynos_drm_dp_encoder_helper_funcs = {
-	.enable = exynos_drm_dp_enable,
-	.disable = exynos_drm_dp_disable,
-	.mode_fixup = NULL,
-	.mode_set = exynos_drm_dp_mode_set,
 };
 
-static const struct drm_connector_funcs exynos_drm_dp_connector_funcs = {
-	.atomic_create_state = drm_atomic_helper_connector_create_state,
-	.atomic_duplicate_state = drm_atomic_helper_connector_duplicate_state,
-	.atomic_destroy_state = drm_atomic_helper_connector_destroy_state,
-	.detect = exynos_drm_dp_connector_detect,
-	.destroy = exynos_drm_dp_destroy_connector,
-	.dpms = drm_helper_connector_dpms,
-	.fill_modes = drm_helper_probe_single_connector_modes,
-};
 
-static const struct drm_connector_helper_funcs
-exynos_drm_dp_connector_helper_funcs = {
-	.get_modes = exynos_drm_dp_get_modes,
-	.mode_valid = exynos_drm_dp_mode_valid,
+
+static inline struct exynos_drm_dp *bridge_to_dp(struct drm_bridge *bridge)
+{
+	return container_of(bridge, struct exynos_drm_dp, bridge);
+}
+
+/*
+ * The connector is built by drm_bridge_connector_init() on the DRM side, which
+ * is also what routes the Type-C alt mode's HPD here: the DP alt mode driver
+ * resolves the connector's "displayport" phandle and raises an out-of-band
+ * hotplug event, which drm_bridge_connector turns into drm_bridge_hpd_notify().
+ * A bridge that built its own connector would never see any of it.
+ */
+static int exynos_drm_dp_bridge_attach(struct drm_bridge *bridge,
+				       struct drm_encoder *encoder,
+				       enum drm_bridge_attach_flags flags)
+{
+	if (!(flags & DRM_BRIDGE_ATTACH_NO_CONNECTOR))
+		return -EINVAL;
+
+	return 0;
+}
+
+static enum drm_connector_status
+exynos_drm_dp_bridge_detect(struct drm_bridge *bridge,
+			    struct drm_connector *connector)
+{
+	struct exynos_drm_dp *dp = bridge_to_dp(bridge);
+
+	/*
+	 * The notified state, not the register: there is no HPD wire on USB-C,
+	 * SYSTEM_HPD_CONTROL only reads back what hpd_notify() forces into it,
+	 * and drm_bridge_connector_detect() feeds this straight back into
+	 * hpd_notify(). Reading the register closes that loop on itself.
+	 */
+	return dp->subdev->oob_plugged ?
+		connector_status_connected : connector_status_disconnected;
+}
+
+static const struct drm_edid *
+exynos_drm_dp_bridge_edid_read(struct drm_bridge *bridge,
+			       struct drm_connector *connector)
+{
+	struct exynos_drm_dp *dp = bridge_to_dp(bridge);
+	struct exynos_dp_subdev *subdev = dp->subdev;
+	u8 support_edid;
+
+	drm_dp_dpcd_readb(&subdev->aux, DP_RECEIVE_PORT_0_CAP_0, &support_edid);
+	if (!(support_edid & DP_LOCAL_EDID_PRESENT))
+		return NULL;
+
+	return drm_edid_read_ddc(connector, &subdev->aux.ddc);
+}
+
+static enum drm_mode_status
+exynos_drm_dp_bridge_mode_valid(struct drm_bridge *bridge,
+				const struct drm_display_info *info,
+				const struct drm_display_mode *mode)
+{
+	/* TODO: reject what the trained link cannot carry */
+	return MODE_OK;
+}
+
+static void exynos_drm_dp_bridge_mode_set(struct drm_bridge *bridge,
+					  const struct drm_display_mode *mode,
+					  const struct drm_display_mode *adjusted_mode)
+{
+	exynos_drm_dp_mode_set(bridge->encoder, mode, adjusted_mode);
+}
+
+static void exynos_drm_dp_bridge_atomic_enable(struct drm_bridge *bridge,
+					       struct drm_atomic_commit *state)
+{
+	exynos_drm_dp_enable(bridge->encoder);
+}
+
+static void exynos_drm_dp_bridge_atomic_disable(struct drm_bridge *bridge,
+						struct drm_atomic_commit *state)
+{
+	exynos_drm_dp_disable(bridge->encoder);
+}
+
+/*
+ * Called by drm_bridge_connector when typec_displayport reports the sink's
+ * HPD through drm_connector_oob_hotplug_event().
+ */
+static void exynos_drm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+					    struct drm_connector *connector,
+					    enum drm_connector_status status)
+{
+	struct exynos_drm_dp *dp = bridge_to_dp(bridge);
+	struct exynos_dp_subdev *subdev = dp->subdev;
+	bool plugged = status == connector_status_connected;
+
+	dp_log_info(dp->dev, "HPD notify: %s\n", plugged ? "plug" : "unplug");
+
+	if (subdev->oob_plugged == plugged)
+		return;
+
+	subdev->oob_plugged = plugged;
+	dp_reg_set_hpd_force(subdev->id, plugged);
+	dp_log_info(dp->dev, "HPD force now %#x\n",
+		    dp_link_read(subdev->id, SYSTEM_HPD_CONTROL));
+
+	if (plugged)
+		queue_delayed_work(subdev->dp_wq, &subdev->hpd_plug_work, 0);
+	else
+		queue_delayed_work(subdev->dp_wq, &subdev->hpd_unplug_work, 0);
+}
+
+static const struct drm_bridge_funcs exynos_drm_dp_bridge_funcs = {
+	.hpd_notify = exynos_drm_dp_bridge_hpd_notify,
+	.attach = exynos_drm_dp_bridge_attach,
+	.detect = exynos_drm_dp_bridge_detect,
+	.edid_read = exynos_drm_dp_bridge_edid_read,
+	.mode_valid = exynos_drm_dp_bridge_mode_valid,
+	.mode_set = exynos_drm_dp_bridge_mode_set,
+	.atomic_enable = exynos_drm_dp_bridge_atomic_enable,
+	.atomic_disable = exynos_drm_dp_bridge_atomic_disable,
+	.atomic_create_state = drm_atomic_helper_bridge_create_state,
+	.atomic_duplicate_state = drm_atomic_helper_bridge_duplicate_state,
+	.atomic_destroy_state = drm_atomic_helper_bridge_destroy_state,
+	.atomic_get_input_bus_fmts = drm_atomic_helper_bridge_propagate_bus_fmt,
 };
 
 static struct dp_encoder *dp_encoder_alloc(struct exynos_drm_dp *dp)
@@ -4662,21 +4807,6 @@ static struct dp_encoder *dp_encoder_alloc(struct exynos_drm_dp *dp)
 	return dp_encoder;
 }
 
-static struct dp_connector *dp_connector_alloc(struct exynos_drm_dp *dp,
-					       struct dp_encoder *dp_encoder)
-{
-	struct dp_connector *dp_connector;
-
-	dp_connector = kzalloc(sizeof(*dp_connector), GFP_KERNEL);
-	if (!dp_connector)
-		return NULL;
-
-	dp_connector->dp = dp;
-	dp_connector->dp_encoder = dp_encoder;
-	dp_encoder->dp_connector = dp_connector;
-
-	return dp_connector;
-}
 
 static int exynos_drm_dp_init_encoder(struct dp_encoder *dp_encoder)
 {
@@ -4697,75 +4827,6 @@ static int exynos_drm_dp_init_encoder(struct dp_encoder *dp_encoder)
 		    encoder->name, encoder->possible_crtcs);
 
 	return 0;
-}
-
-static int exynos_drm_dp_init_connector(struct dp_connector *dp_connector)
-{
-	struct exynos_drm_dp *dp = dp_connector->dp;
-	struct drm_connector *connector = &dp_connector->base;
-	struct drm_encoder *encoder = &dp_connector->dp_encoder->base;
-	struct device *dev = dp->dev;
-	int ret = 0;
-
-	connector->polled = DRM_CONNECTOR_POLL_HPD;
-
-	ret = drm_connector_init(dp->drm_dev, connector,
-				 &exynos_drm_dp_connector_funcs,
-				 DRM_MODE_CONNECTOR_DisplayPort);
-	if (ret) {
-		dp_log_err(dev, "Failed to create connector %d\n", ret);
-		drm_connector_cleanup(connector);
-		return ret;
-	}
-
-	drm_connector_helper_add(connector,
-				 &exynos_drm_dp_connector_helper_funcs);
-	drm_connector_attach_encoder(connector, encoder);
-
-	dp_log_info(dev, "Success to create connector %s\n", connector->name);
-
-	return 0;
-}
-
-static int exynos_drm_dp_get_timings(struct device *dev)
-{
-	struct exynos_drm_dp *dp = dev_get_drvdata(dev);
-	struct device_node *np = dev->of_node;
-	struct device_node *timing_np;
-
-	timing_np = of_parse_phandle(np, "samsung,display-timings", 0);
-	if (!timing_np) {
-		dp_log_info(dev, "could not get display timings\n");
-		return 0;
-	}
-
-	dp->timings = of_get_display_timings(timing_np);
-	if (IS_ERR_OR_NULL(dp->timings)) {
-		dp_log_err(dev, "could not get native display timing\n");
-		of_node_put(timing_np);
-		return -EINVAL;
-	}
-	of_node_put(timing_np);
-
-	return 0;
-}
-
-static void exynos_drm_dp_get_native_mode(struct device *dev,
-					  struct dp_connector *dp_connector)
-{
-	struct device_node *np = dev->of_node;
-	int idx;
-
-	if (of_property_read_s32(np, "samsung,native-mode,idx", &idx) < 0)
-		dp_connector->native_mode = -1;
-	else
-		dp_connector->native_mode = idx;
-
-	dp_connector->native_only =
-		of_property_read_bool(np, "samsung,native-only");
-
-	of_property_read_u32(np, "samsung,native-mode,bpc",
-				&dp_connector->base.display_info.bpc);
 }
 
 static ssize_t exynos_drm_dp_aux_transfer(struct drm_dp_aux *aux,
@@ -4846,7 +4907,7 @@ static int exynos_drm_dp_subdev_bind(struct device *dev,
 		goto err_aux_register;
 	}
 
-	if (gpiod_get_value(subdev->hpd_gpio))
+	if (dp_reg_get_hpd_status(subdev->id))
 		exynos_drm_dp_reset(subdev);
 
 	dp_log_dbg(dev, "%s registered for aux_transfer\n", subdev->aux.name);
@@ -4862,7 +4923,7 @@ static int exynos_drm_dp_bind(struct device *dev,
 {
 	struct exynos_drm_dp *dp = dev_get_drvdata(dev);
 	struct dp_encoder *dp_encoder;
-	struct dp_connector *dp_connector;
+	struct drm_connector *connector;
 	struct drm_device *drm_dev = data;
 	int ret = 0;
 
@@ -4876,33 +4937,59 @@ static int exynos_drm_dp_bind(struct device *dev,
 	if (ret < 0)
 		goto err_encoder_init;
 
-	dp_connector = dp_connector_alloc(dp, dp_encoder);
-	if (IS_ERR_OR_NULL(dp_connector))
-		goto err_connector_init;
-	ret = exynos_drm_dp_init_connector(dp_connector);
-	if (ret < 0)
-		goto err_connector_init;
-
-	/* Set base encoder/connector */
 	dp->encoder = &dp_encoder->base;
-	dp->connector = &dp_connector->base;
 
-	ret = exynos_drm_dp_get_timings(dev);
+	/*
+	 * The bridge owns the connector, so the mode and EDID come from its
+	 * callbacks rather than this driver's own drm_connector, and HPD from
+	 * the alt mode reaches it through drm_bridge_connector.
+	 */
+	ret = drm_bridge_attach(dp->encoder, &dp->bridge, NULL,
+				DRM_BRIDGE_ATTACH_NO_CONNECTOR);
 	if (ret < 0)
-		goto err_connector_init;
+		goto err_encoder_init;
 
-	exynos_drm_dp_get_native_mode(dev, dp_connector);
+	connector = drm_bridge_connector_init(drm_dev, dp->encoder);
+	if (IS_ERR(connector)) {
+		ret = PTR_ERR(connector);
+		goto err_encoder_init;
+	}
+
+	ret = drm_connector_attach_encoder(connector, dp->encoder);
+	if (ret < 0)
+		goto err_encoder_init;
+
+	dp->connector = connector;
 
 	ret = exynos_drm_dp_subdev_bind(dev, dp);
 	if (ret < 0)
-		goto err_connector_init;
+		goto err_encoder_init;
 
-	exynos_drm_dp_mst_init(dp_connector);
+	/*
+	 * DPOSC has to run before the first link register access, and pd_hsi0
+	 * has to be up before DPOSC: the CMU stalls on the DP_LINK Q-channel
+	 * otherwise, which the SoC answers with a reset. Component bind is
+	 * past both.
+	 */
+	ret = clk_prepare_enable(dp->dposc);
+	if (ret < 0) {
+		dp_log_err(dp->dev, "cannot enable dposc, %d\n", ret);
+		goto err_encoder_init;
+	}
+	ret = clk_prepare_enable(dp->pclk);
+	if (ret < 0) {
+		dp_log_err(dp->dev, "cannot enable pclk, %d\n", ret);
+		clk_disable_unprepare(dp->dposc);
+		goto err_encoder_init;
+	}
+	if (clk_get_rate(dp->dposc) != 40000000)
+		dp_log_err(dp->dev, "dposc is %lu Hz, not 40 MHz\n",
+			   clk_get_rate(dp->dposc));
+	/* the OSC dividers are in MHz, so they follow whatever DPOSC runs at */
+	dp->subdev->osc_mhz = DIV_ROUND_CLOSEST(clk_get_rate(dp->dposc),
+						1000000);
+	usleep_range(10000, 10030);
 
-	/* enable_irq end of binding */
-	if (dp->subdev)
-		enable_irq(dp->subdev->hpd_gpio_irq);
-	
 	ret = exynos_drm_dp_start(dp->subdev);
 	if (ret < 0)
 		dp_log_err(dp->dev, "cannot start DP[%d], %d\n", dp->id, ret);
@@ -4913,13 +5000,10 @@ static int exynos_drm_dp_bind(struct device *dev,
 
 	return 0;
 
-err_connector_init:
-	if (dp_connector)
-		exynos_drm_dp_destroy_connector(&dp_connector->base);
 err_encoder_init:
 	if (dp_encoder)
 		exynos_drm_dp_destroy_encoder(&dp_encoder->base);
-	dp_log_err(dev, "failed: drm_encoder/connector_init() : %d\n", ret);
+	dp_log_err(dev, "failed: drm_encoder/bridge attach: %d\n", ret);
 	return ret;
 }
 
@@ -4939,13 +5023,12 @@ static void exynos_drm_dp_unbind(struct device *dev, struct device *master,
 
 	drm_dp_aux_unregister(&subdev->aux);
 
-	display_timings_release(dp->timings);
-
 	flush_delayed_work(&subdev->hpd_irq_work);
 
 	disable_irq(subdev->irq);
-	disable_irq(subdev->hpd_gpio_irq);
 
+	clk_disable_unprepare(dp->pclk);
+	clk_disable_unprepare(dp->dposc);
 
 	dp_log_exit(dev);
 	return;
@@ -4961,17 +5044,18 @@ static int exynos_drm_dp_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct exynos_drm_dp *dp;
 
-	struct clk *aclk, *pclk;
 	int ret = 0;
 
-	dp = devm_kzalloc(dev, sizeof(struct exynos_drm_dp),
-			  GFP_KERNEL);
-	if (!dp)
-		return -ENOMEM;
+	dp = devm_drm_bridge_alloc(dev, struct exynos_drm_dp, bridge,
+				   &exynos_drm_dp_bridge_funcs);
+	if (IS_ERR(dp))
+		return PTR_ERR(dp);
 
 	dp->dev = dev;
 	dp->bridge.of_node = dev->of_node;
-	dp->bridge.driver_private = dp;
+	dp->bridge.type = DRM_MODE_CONNECTOR_DisplayPort;
+	dp->bridge.ops = DRM_BRIDGE_OP_DETECT | DRM_BRIDGE_OP_EDID |
+			 DRM_BRIDGE_OP_HPD;
 	drm_bridge_add(&dp->bridge);
 
 	dp->id = 0;
@@ -4980,13 +5064,20 @@ static int exynos_drm_dp_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, dp);
 
-	aclk = devm_clk_get_enabled(dp->dev, "aclk");
-	if (IS_ERR(aclk))
-		return dev_err_probe(dp->dev, PTR_ERR(aclk),
-				     "Could not get aclk clock\n");
-	pclk = devm_clk_get_enabled(dp->dev, "pclk");
-	if (IS_ERR(pclk))
-		return dev_err_probe(dp->dev, PTR_ERR(pclk),
+	/*
+	 * Taken but not enabled: ungating at probe resets the SoC. Both are
+	 * needed before the first register access -- DPOSC for the link and
+	 * PCLK for its APB. The vendor DT names only DPOSC because their CAL
+	 * layer drives PCLK off the Q-channel; under CCF an unclaimed PCLK
+	 * just stays gated.
+	 */
+	dp->dposc = devm_clk_get(dp->dev, "dposc");
+	if (IS_ERR(dp->dposc))
+		return dev_err_probe(dp->dev, PTR_ERR(dp->dposc),
+				     "Could not get dposc clock\n");
+	dp->pclk = devm_clk_get(dp->dev, "pclk");
+	if (IS_ERR(dp->pclk))
+		return dev_err_probe(dp->dev, PTR_ERR(dp->pclk),
 				     "Could not get pclk clock\n");
 
 	dp_log_info(dev, "is successfully\n");

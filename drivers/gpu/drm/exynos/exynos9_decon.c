@@ -10,9 +10,12 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/irq.h>
 #include <linux/iopoll.h>
+#include <linux/timer.h>
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_vblank.h>
@@ -33,6 +36,14 @@
 
 #include "exynos9_decon.h"
 #include "regs-decon9.h"
+
+/*
+ * Command-mode escape hatch: leaving the trigger armed makes the DECON re-send
+ * the last frame on every TE, which is how this driver ran before one-shot.
+ */
+static bool decon_oneshot = true;
+module_param_named(oneshot, decon_oneshot, bool, 0644);
+MODULE_PARM_DESC(oneshot, "command mode: send one frame per commit");
 
 /* PD : Porter-Duff */
 enum decon_blend_pd_func {
@@ -1476,8 +1487,8 @@ static void decon_update_plane(struct exynos_drm_crtc *crtc,
 	 */
 	decon_set_win_color_map(window, false);
 
-	dpp_update(window->dpp, 0, state);
-	dpu_dma_update(dma_ctx, 0, state);
+	dpp_update(window->dpp, state);
+	dpu_dma_update(dma_ctx, window->dpp->type, state);
 
 	ctx->cal_ops->enable_window(ctx, window->idx, config);
 
@@ -1499,6 +1510,50 @@ static void decon_disable_plane(struct exynos_drm_crtc *crtc,
 
 	drm_dbg(ctx->drm_dev, "WINDOW-%d(%s)\n", window->idx,
 		dev_name(window->dpp->dev));
+}
+
+/*
+ * A command-mode frame is triggered by the panel's TE, and that same TE is the
+ * vblank (see decon_te_irq_handler).  A TE that never arrives therefore strands
+ * the commit that armed it: the vblank counter does not advance and the flip
+ * event queued by exynos_crtc_handle_event() is never delivered.
+ * drm_atomic_helper_wait_for_vblanks() warns after 100 ms, and the *next*
+ * commit then blocks 10 s per object in
+ * drm_atomic_helper_wait_for_dependencies(), so one lost TE freezes the display
+ * for ~30 s.
+ *
+ * The vendor driver does not assume that cannot happen: decon_wait_for_flip_done()
+ * bounds the wait and calls decon_force_vblank_event() on a miss.  Do the same
+ * with a timer, since this driver uses the generic commit tail.  The timeout is
+ * deliberately shorter than the 100 ms the vblank helper allows, so recovery
+ * lands before it gives up; it is still more than three TE periods at 60 Hz.
+ *
+ * Damage control, not a cure: the frame did not scan out, completing the vblank
+ * only keeps the pipeline moving.
+ */
+#define DECON_VBLANK_TIMEOUT_MS	60
+
+static void decon_vblank_timeout(struct timer_list *t)
+{
+	struct decon_context *ctx = timer_container_of(ctx, t, vblank_timer);
+
+	if (!ctx->crtc)
+		return;
+
+	/*
+	 * win_update_req_get() still set means the shadow -> active latch never
+	 * happened, so the window config the commit programmed is not live and
+	 * the blender has nothing to send.
+	 */
+	dev_warn_ratelimited(ctx->dev,
+			     "DECON%u frame timed out, completing vblank (int_pend %#x win%u shd_req %#x live %#x)\n",
+			     ctx->idx,
+			     ctx->cal_ops->int_pend ? ctx->cal_ops->int_pend(ctx) : 0,
+			     ctx->win[0].idx,
+			     ctx->cal_ops->win_update_req_get(ctx, ctx->win[0].idx),
+			     ctx->cal_ops->win_status(ctx, ctx->win[0].idx));
+
+	drm_crtc_handle_vblank(&ctx->crtc->base);
 }
 
 static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
@@ -1526,6 +1581,17 @@ static void decon_atomic_flush(struct exynos_drm_crtc *crtc)
 	ctx->cal_ops->update_req_global(ctx);
 
 	ctx->cal_ops->set_te(ctx, DECON_TRIG_UNMASK);
+
+	/*
+	 * A frame is now expected.  Arm the recovery timer before handing the
+	 * event over, so a vblank that never arrives cannot strand this commit.
+	 * Video mode needs this as much as command mode: its vblank is the
+	 * frame-done interrupt, and a DECON that emits no frame freezes every
+	 * later commit for 10 s apiece in wait_for_dependencies().
+	 */
+	mod_timer(&ctx->vblank_timer,
+		  jiffies + msecs_to_jiffies(DECON_VBLANK_TIMEOUT_MS));
+
 	exynos_crtc_handle_event(crtc);
 }
 
@@ -1595,18 +1661,43 @@ static void decon_set_mode(struct exynos_drm_crtc *crtc)
 static void decon_enable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
+	struct exynos_drm_private *priv = ctx->drm_dev->dev_private;
+	int ret;
+
+	if (ctx->enabled)
+		return;
+
+	/*
+	 * Powers pd-dpuf0/pd-dpub and, through the "iommus" device link, the
+	 * SysMMU the DPP fetches through. Must precede cal_ops->enable(): the
+	 * DECON must not start fetching before its translation is up.
+	 */
+	ret = pm_runtime_resume_and_get(priv->dma_dev);
+	if (ret < 0) {
+		drm_err(ctx->drm_dev, "cannot resume DPU DMA: %d\n", ret);
+		return;
+	}
+
+	ret = pm_runtime_resume_and_get(ctx->dev);
+	if (ret < 0) {
+		drm_err(ctx->drm_dev, "cannot resume DECON: %d\n", ret);
+		pm_runtime_put_sync(priv->dma_dev);
+		return;
+	}
 
 	drm_display_mode_to_videomode(&crtc->base.mode, &ctx->v_mode);
 
 	ctx->config.image_width = ctx->v_mode.hactive;
 	ctx->config.image_height = ctx->v_mode.vactive;
 	ctx->config.fps = drm_mode_vrefresh(&crtc->base.mode);
+	ctx->config.dsc = crtc->dsc;
 
 	decon_set_mode(crtc);
 
 	ctx->cal_ops->enable(ctx);
 
 	enable_irq(ctx->irq_fd);
+	ctx->enabled = true;
 
 	decon_config_print(&ctx->config);
 	drm_info(ctx->drm_dev, "enabled! crtc[%d] = %dx%d-%dHz (%d out_bpc)\n",
@@ -1618,8 +1709,28 @@ static void decon_enable(struct exynos_drm_crtc *crtc)
 static void decon_disable(struct exynos_drm_crtc *crtc)
 {
 	struct decon_context *ctx = crtc->ctx;
+	struct exynos_drm_private *priv = ctx->drm_dev->dev_private;
+
+	/*
+	 * A CRTC can be disabled twice without an enable in between, so this has
+	 * to be idempotent: disable_irq() nests, and a second one leaves frame
+	 * done masked for good once the next enable has undone only one of them.
+	 */
+	if (!ctx->enabled)
+		return;
+	ctx->enabled = false;
 
 	disable_irq(ctx->irq_fd);
+	timer_delete_sync(&ctx->vblank_timer);
+
+	/*
+	 * The next enable quiesces with a per-frame off, which retires at a frame
+	 * boundary that one frame per commit no longer guarantees. Stop it here.
+	 */
+	ctx->cal_ops->disable(ctx);
+
+	pm_runtime_put_sync(ctx->dev);
+	pm_runtime_put_sync(priv->dma_dev);
 }
 
 static irqreturn_t decon_te_irq_handler(int irq, void *dev_id)
@@ -1631,6 +1742,8 @@ static irqreturn_t decon_te_irq_handler(int irq, void *dev_id)
 	 * continuous (every panel refresh) and synced to the panel, independent
 	 * of whether the DECON emitted a frame this cycle.
 	 */
+	timer_delete(&ctx->vblank_timer);
+
 	if (ctx->crtc)
 		drm_crtc_handle_vblank(&ctx->crtc->base);
 
@@ -1653,6 +1766,8 @@ static void decon_disable_vblank(struct exynos_drm_crtc *crtc)
 
 	if (ctx->te_irq > 0)
 		disable_irq_nosync(ctx->te_irq);
+
+	timer_delete(&ctx->vblank_timer);
 }
 
 static const struct exynos_drm_crtc_ops decon_crtc_ops = {
@@ -1692,12 +1807,33 @@ static const u32 dpp_gf_formats[] = {
 	DRM_FORMAT_BGR565,
 };
 
+/*
+ * Each DECON fetches through its own DPP. Taking whichever DPP bound last
+ * would back this DECON's planes with the channel already feeding another
+ * one, so disabling an unused plane here would stop that DECON's scanout.
+ */
+static struct exynos_dpp_context *decon_find_dpp(struct device *dev)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	np = of_parse_phandle(dev->of_node, "dpps", 0);
+	if (!np)
+		return NULL;
+
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return NULL;
+
+	return dev_get_drvdata(&pdev->dev);
+}
+
 static int decon_bind(struct device *dev, struct device *master, void *data)
 {
 	struct decon_context *ctx = dev_get_drvdata(dev);
 	struct drm_device *drm_dev = data;
 	struct drm_plane *primary_plane = NULL;
-	struct exynos_drm_private *priv = drm_dev->dev_private;
 
 	int i, ret = 0;
 
@@ -1710,12 +1846,26 @@ static int decon_bind(struct device *dev, struct device *master, void *data)
 	 * decon_reg_stop/SRESET).
 	 */
 
+	struct exynos_dpp_context *dpp = decon_find_dpp(dev);
+
 	ctx->drm_dev = drm_dev;
 
+	/*
+	 * The window registers are one bank shared by every DECON -- WIN_OFFSET
+	 * indexes by window, not by DECON, and the "win" reg region is the same
+	 * physical block in both DECON nodes. Two DECONs both using window 0
+	 * therefore write the same registers: DECON1 stamped its 1920x1080
+	 * geometry over the panel's 1280x2856 window, blacking out everything
+	 * below line 1080 and leaving neither DECON with a sane window.
+	 *
+	 * Carve the bank up statically, one quarter per DECON. The vendor hands
+	 * windows out dynamically from a driver-wide available_win_mask.
+	 */
 	for (i = 0; i < ctx->win_cnt; i++) {
 		struct decon_win *win = &ctx->win[i];
-		struct exynos_dpp_context *dpp = dev_get_drvdata(priv->dpp_dev);
+
 		ctx->win[i].dpp = dpp;
+		win->idx = ctx->idx * (MAX_WIN_PER_DECON / 2) + i;
 
 		if (!dpp)
 			continue;
@@ -1774,8 +1924,25 @@ static irqreturn_t decon_irq_handler(int irq, void *dev_id)
 	 * frame) still observe a vblank instead of timing out.  In video mode
 	 * there is no panel TE, so frame-done is the vblank.
 	 */
-	if (ctx->config.mode.op_mode == DECON_VIDEO_MODE)
+	if (ctx->config.mode.op_mode == DECON_VIDEO_MODE) {
+		timer_delete(&ctx->vblank_timer);
 		drm_crtc_handle_vblank(&ctx->crtc->base);
+		return IRQ_HANDLED;
+	}
+
+	/*
+	 * The frame is out.  Disarm the trigger so the next TE does not send it
+	 * again: the panel holds the image in its own GRAM, and re-sending it
+	 * every TE keeps the DSI link at full rate on a static screen and denies
+	 * the DDIC the gap in host traffic that its frame insertion waits for.
+	 * decon_atomic_flush() re-arms the trigger when there is a new frame.
+	 *
+	 * Assumes frame-done for a frame lands before the commit after it arms
+	 * the trigger again - a late one would disarm a frame that has not been
+	 * sent, stalling it until the next commit.
+	 */
+	if (decon_oneshot)
+		ctx->cal_ops->set_te(ctx, DECON_TRIG_MASK);
 
 	return IRQ_HANDLED;
 }
@@ -1794,6 +1961,14 @@ static int decon_probe(struct platform_device *pdev)
 
 	ctx->dev = dev;
 
+	/*
+	 * Which DECON this is. Indexes every per-instance register array in the
+	 * cal back-ends, so two DECONs without distinct ids would scribble on
+	 * each other's blocks.
+	 */
+	if (of_property_read_u32(dev->of_node, "decon,id", &ctx->idx))
+		ctx->idx = 0;
+
 	drv_data = of_device_get_match_data(dev);
 	if (!drv_data)
 		return -ENODEV;
@@ -1806,6 +1981,8 @@ static int decon_probe(struct platform_device *pdev)
 	if (IS_ERR(ctx->aclk))
 		return dev_err_probe(dev, PTR_ERR(ctx->aclk),
 				     "Cannot get aclk\n");
+
+	timer_setup(&ctx->vblank_timer, decon_vblank_timeout, 0);
 
 	ctx->irq_fd = platform_get_irq(pdev, 0);
 	irq_set_status_flags(ctx->irq_fd, IRQ_NOAUTOEN);
@@ -1855,6 +2032,9 @@ static int decon_probe(struct platform_device *pdev)
 		return ret;
 
 	platform_set_drvdata(pdev, ctx);
+
+	/* Taken in decon_enable(), dropped in decon_disable(). */
+	pm_runtime_enable(dev);
 
 	return component_add(dev, &decon_component_ops);
 }
